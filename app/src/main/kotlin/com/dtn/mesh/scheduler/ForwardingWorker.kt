@@ -1,0 +1,73 @@
+package com.dtn.mesh.scheduler
+
+import android.content.Context
+import android.util.Log
+import androidx.hilt.work.HiltWorker
+import androidx.work.CoroutineWorker
+import androidx.work.WorkerParameters
+import com.dtn.mesh.database.dao.ForwardingDecisionDao
+import com.dtn.mesh.queue.MessageQueueManager
+import com.dtn.mesh.routing.StrategySelector
+import com.dtn.mesh.service.DtnOrchestrator
+import dagger.assisted.Assisted
+import dagger.assisted.AssistedInject
+
+/**
+ * Periodic WorkManager job — HOUSEKEEPING ONLY.
+ *
+ * Runs every 15 minutes (WorkManager minimum) and performs:
+ * 1. TTL expiry & garbage collection
+ * 2. Revert timed-out FORWARDING → BUFFERED
+ * 3. Periodic routing aging (both strategies)
+ * 4. Collect pending Q-updates and route to orchestrator (for thread safety)
+ * 5. Buffer pressure enforcement / drop policy
+ *
+ * Real-time forwarding is handled by [DtnOrchestrator] on encounter events.
+ * This worker NEVER calls transport.sendMessage() or qEngine.update() directly.
+ */
+@HiltWorker
+class ForwardingWorker @AssistedInject constructor(
+    @Assisted context: Context,
+    @Assisted params: WorkerParameters,
+    private val queueManager: MessageQueueManager,
+    private val strategySelector: StrategySelector,
+    private val decisionDao: ForwardingDecisionDao,
+    private val orchestrator: DtnOrchestrator,
+) : CoroutineWorker(context, params) {
+
+    companion object {
+        private const val TAG = "ForwardingWorker"
+        const val WORK_NAME = "dtn_housekeeping_cycle"
+    }
+
+    override suspend fun doWork(): Result {
+        Log.d(TAG, "Housekeeping cycle starting")
+
+        // Phase 1: TTL expiry
+        val expired = queueManager.expireMessages()
+        if (expired > 0) Log.d(TAG, "Expired $expired messages")
+
+        // Phase 2: Revert timed-out forwards
+        queueManager.revertTimedOutForwards()
+
+        // Phase 3: Purge old terminal messages
+        queueManager.purgeOldMessages()
+
+        // Phase 4: Periodic routing aging (both strategies)
+        strategySelector.onPeriodicAge()
+
+        // Phase 5: Collect pending Q-updates and route to orchestrator
+        // (Q-engine mutations ONLY happen on orchestrator's single-threaded dispatcher)
+        val pendingUpdates = decisionDao.getPendingUpdates()
+        if (pendingUpdates.isNotEmpty()) {
+            orchestrator.enqueueBatchQUpdates(pendingUpdates)
+            Log.d(TAG, "Routed ${pendingUpdates.size} Q-updates to orchestrator")
+        }
+
+        // Phase 6: Buffer pressure enforcement
+        queueManager.enforceBufferPressure(strategySelector)
+
+        Log.d(TAG, "Housekeeping cycle complete")
+        return Result.success()
+    }
+}

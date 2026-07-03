@@ -1,0 +1,12 @@
+files:
+  - source: /**/src/commonMain/composeResources/values/strings.xml
+    translation: /%original_path%-%two_letters_code%/strings.xml
+    translate_attributes: 0
+    content_segmentation: 0
+    escape_quotes: 0
+    escape_special_characters: 0
+    type: android
+  - source: /fastlane/metadata/android/en-US/*.txt
+    translation: /fastlane/metadata/android/%locale%/%original_file_name%
+  - source: /fastlane/metadata/android/en-US/changelogs/default.txt
+    translation: /fastlane/metadata/android/%locale%/changelogs/%original_file_name%

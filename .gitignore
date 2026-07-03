@@ -1,0 +1,31 @@
+# Gradle files and directories
+.gradle/
+.kotlin/
+/build/
+**/build/
+
+# Android Studio / IntelliJ / Eclipse IDE files
+.idea/
+*.iml
+*.ipr
+*.iws
+local.properties
+.navigation/
+captures/
+.externalNativeBuild/
+.cxx/
+cmake-build-*/
+
+# OS-specific temporary files
+.DS_Store
+Thumbs.db
+
+# JVM crash logs
+**/hs_err_pid*.log
+**/replay_pid*.log
+
+# LMS project files and unrelated utilities
+LMS_Project_Scope_Assignment.docx
+~$*.docx
+~$LMS_Project_Scope_Assignment.docx
+docx_generator/

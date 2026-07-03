@@ -1,0 +1,50 @@
+# Android Studio
+/.idea/*
+!/.idea/codeStyles
+!/.idea/dictionaries/
+!/.idea/runConfigurations/
+!/.idea/icon.svg
+*.iws
+*.iml
+
+.gradle
+/local.properties
+.DS_Store
+**/build/**
+/captures
+.externalNativeBuild
+.cxx
+/app/release
+/buildSrc/build
+**/debug/**
+**/release/**
+
+# Java KeyStore certificates
+*.jks
+keystore.properties
+
+# AGP profiling traces
+*.trace
+
+# Kotlin compiler
+.kotlin
+
+# VS code
+.vscode/settings.json
+
+# Secrets
+/secrets.properties
+/fastlane/play-store-credentials.json
+**/google-services.json
+
+/fastlane/report.xml
+
+/build-logic/convention/build/*
+/build-logic/build/
+
+# Personal build scripts
+build-and-install-android.sh
+wireless-install.sh
+
+# Git worktrees
+.worktrees/

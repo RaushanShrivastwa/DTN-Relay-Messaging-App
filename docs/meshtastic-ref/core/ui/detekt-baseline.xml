@@ -1,0 +1,13 @@
+<?xml version='1.0' encoding='UTF-8'?>
+<SmellBaseline>
+  <ManuallySuppressedIssues/>
+  <CurrentIssues>
+    <ID>MagicNumber:EditIPv4Preference.kt$0xff</ID>
+    <ID>MagicNumber:EditIPv4Preference.kt$16</ID>
+    <ID>MagicNumber:EditIPv4Preference.kt$24</ID>
+    <ID>MagicNumber:EditIPv4Preference.kt$8</ID>
+    <ID>MagicNumber:EditListPreference.kt$12345</ID>
+    <ID>MagicNumber:EditListPreference.kt$67890</ID>
+    <ID>MagicNumber:LazyColumnDragAndDropDemo.kt$50</ID>
+  </CurrentIssues>
+</SmellBaseline>

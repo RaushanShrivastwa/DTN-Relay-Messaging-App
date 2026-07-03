@@ -1,0 +1,34 @@
+name: Android CI (Merge Queue)
+
+on:
+  merge_group:
+    types: [checks_requested]
+
+concurrency:
+  group: build-mq-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  android-check:
+    if: github.repository == 'meshtastic/Meshtastic-Android'
+    uses: ./.github/workflows/reusable-check.yml
+    with:
+      api_levels: '[26, 35]' # Comprehensive testing for Merge Queue
+      flavors: '["google", "fdroid"]'
+      upload_artifacts: false
+    secrets: inherit
+
+  check-workflow-status:
+    name: Check Workflow Status
+    runs-on: ubuntu-latest
+    needs:
+      - android-check
+    if: always()
+    steps:
+      - name: Check Workflow Status
+        run: |
+          if [[ "${{ needs.android-check.result }}" == "failure" || "${{ needs.android-check.result }}" == "cancelled" ]]; then
+            echo "::error::Android Check failed"
+            exit 1
+          fi
+          echo "All jobs passed successfully"

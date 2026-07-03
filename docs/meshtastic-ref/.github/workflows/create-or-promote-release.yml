@@ -1,0 +1,246 @@
+name: Create or Promote Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_version:
+        description: 'Base version for the release (e.g., 2.3.0)'
+        required: true
+      channel:
+        description: 'The channel to create a release for or promote to'
+        required: true
+        type: choice
+        options:
+          - internal
+          - closed
+          - open
+          - production
+      dry_run:
+        description: 'If true, calculates the tag but does not push it or start the release'
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: read
+  id-token: write
+  attestations: write
+
+jobs:
+  determine-tags:
+    runs-on: ubuntu-latest
+    outputs:
+      tag_to_process: ${{ steps.calculate_tags.outputs.tag_to_process }}
+      release_name: ${{ steps.calculate_tags.outputs.release_name }}
+      final_tag: ${{ steps.calculate_tags.outputs.final_tag }}
+      from_channel: ${{ steps.calculate_tags.outputs.from_channel }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.CROWDIN_GITHUB_TOKEN }}
+
+      - name: Calculate tags
+        id: calculate_tags
+        run: |
+          BASE_VERSION="${{ inputs.base_version }}"
+          CHANNEL="${{ inputs.channel }}"
+
+          if [[ "$CHANNEL" == "internal" ]]; then
+            # This is a new build, create a new internal tag
+            LATEST_TAG=$(git tag --list "v${BASE_VERSION}-internal.*" --sort=-v:refname | head -n 1)
+
+            if [ -z "$LATEST_TAG" ]; then
+              INCREMENT=1
+            else
+              INCREMENT=$(echo "$LATEST_TAG" | sed -n "s/.*-internal\.\([0-9]*\)/\1/p" | awk '{print $1+1}')
+            fi
+
+            NEW_TAG="v${BASE_VERSION}-internal.${INCREMENT}"
+            echo "Calculated new tag: $NEW_TAG"
+            echo "tag_to_process=$NEW_TAG" >> $GITHUB_OUTPUT
+            echo "release_name=$NEW_TAG" >> $GITHUB_OUTPUT
+            echo "final_tag=$NEW_TAG" >> $GITHUB_OUTPUT
+          else
+            # This is a promotion, find the latest tag from the previous channel to promote
+            FROM_CHANNEL="internal"
+            if [[ "$CHANNEL" == "open" ]]; then
+              FROM_CHANNEL="closed"
+            elif [[ "$CHANNEL" == "production" ]]; then
+              FROM_CHANNEL="open"
+            fi
+            
+            LATEST_TAG_TO_PROMOTE=$(git tag --list "v${BASE_VERSION}-${FROM_CHANNEL}.*" --sort=-v:refname | head -n 1)
+
+            if [ -z "$LATEST_TAG_TO_PROMOTE" ]; then
+              echo "::error::No ${FROM_CHANNEL} release found for base version ${BASE_VERSION} to promote."
+              exit 1
+            fi
+
+            echo "Found latest ${FROM_CHANNEL} tag to promote: $LATEST_TAG_TO_PROMOTE"
+
+            # Calculate the increment for the TARGET channel
+            if [[ "$CHANNEL" != "production" ]]; then
+                LATEST_CHANNEL_TAG=$(git tag --list "v${BASE_VERSION}-${CHANNEL}.*" --sort=-v:refname | head -n 1)
+
+                if [ -z "$LATEST_CHANNEL_TAG" ]; then
+                  INCREMENT=1
+                else
+                  INCREMENT=$(echo "$LATEST_CHANNEL_TAG" | sed -n "s/.*-${CHANNEL}\.\([0-9]*\)/\1/p" | awk '{print $1+1}')
+                fi
+                
+                NEW_TAG="v${BASE_VERSION}-${CHANNEL}.${INCREMENT}"
+            else
+                # Production is special, it has no increment
+                NEW_TAG="v${BASE_VERSION}"
+            fi
+
+            echo "New release name will be: $NEW_TAG"
+            echo "Final tag will be: $NEW_TAG"
+            echo "from_channel=${FROM_CHANNEL}" >> $GITHUB_OUTPUT
+            echo "tag_to_process=${LATEST_TAG_TO_PROMOTE}" >> $GITHUB_OUTPUT
+            echo "release_name=${NEW_TAG}" >> $GITHUB_OUTPUT
+            echo "final_tag=${NEW_TAG}" >> $GITHUB_OUTPUT
+          fi
+        shell: bash
+
+      - name: Update External Assets (Firmware, Hardware, Protos)
+        if: ${{ !inputs.dry_run && inputs.channel == 'internal' }}
+        run: |
+          # Update Submodules (Protobufs)
+          echo "Updating core/proto submodule..."
+          git submodule update --init --remote core/proto
+          
+          # Update Firmware List
+          firmware_file_path="app/src/main/assets/firmware_releases.json"
+          temp_firmware_file="/tmp/new_firmware_releases.json"
+          
+          echo "Fetching latest firmware releases..."
+          curl -s --fail https://api.meshtastic.org/github/firmware/list > "$temp_firmware_file"
+          
+          if ! jq empty "$temp_firmware_file" 2>/dev/null; then
+            echo "::error::Firmware API returned invalid JSON data. Aborting."
+            exit 1
+          else
+            if [ ! -f "$firmware_file_path" ] || ! jq --sort-keys . "$temp_firmware_file" | diff -q - <(jq --sort-keys . "$firmware_file_path"); then
+              echo "Changes detected in firmware list or local file missing. Updating $firmware_file_path."
+              cp "$temp_firmware_file" "$firmware_file_path"
+            else
+              echo "No changes detected in firmware list."
+            fi
+          fi
+
+          # Update Hardware List
+          hardware_file_path="app/src/main/assets/device_hardware.json"
+          temp_hardware_file="/tmp/new_device_hardware.json"
+
+          echo "Fetching latest device hardware data..."
+          curl -s --fail https://api.meshtastic.org/resource/deviceHardware > "$temp_hardware_file"
+
+          if ! jq empty "$temp_hardware_file" 2>/dev/null; then
+            echo "::error::Hardware API returned invalid JSON data. Aborting."
+            exit 1
+          else
+            if [ ! -f "$hardware_file_path" ] || ! jq --sort-keys . "$temp_hardware_file" | diff -q - <(jq --sort-keys . "$hardware_file_path"); then
+              echo "Changes detected in hardware list or local file missing. Updating $hardware_file_path."
+              cp "$temp_hardware_file" "$hardware_file_path"
+            else
+              echo "No changes detected in hardware list."
+            fi
+          fi
+
+      - name: Sync with Crowdin
+        if: ${{ !inputs.dry_run && inputs.channel == 'internal' }}
+        uses: crowdin/github-action@v2
+        with:
+          base_url: 'https://meshtastic.crowdin.com/api/v2'
+          config: 'crowdin.yml'
+          crowdin_branch_name: 'main'
+          upload_sources: true
+          upload_sources_args: '--preserve-hierarchy'
+          upload_translations: false
+          download_translations: true
+          download_translations_args: '--preserve-hierarchy'
+          create_pull_request: false
+          push_translations: false
+          push_sources: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CROWDIN_PROJECT_ID: ${{ secrets.CROWDIN_PROJECT_ID }}
+          CROWDIN_PERSONAL_TOKEN: ${{ secrets.CROWDIN_PERSONAL_TOKEN }}
+
+      - name: Commit Release Assets (Translations, Data, Config)
+        if: ${{ !inputs.dry_run && inputs.channel == 'internal' }}
+        env:
+          FINAL_TAG: ${{ steps.calculate_tags.outputs.final_tag }}
+        run: |
+          # Calculate Version Code
+          OFFSET=$(grep '^VERSION_CODE_OFFSET=' config.properties | cut -d'=' -f2)
+          COMMIT_COUNT=$(git rev-list --count HEAD)
+          # +1 because we are about to add a commit
+          VERSION_CODE=$((COMMIT_COUNT + OFFSET + 1))
+          
+          echo "Calculated Version Code: $VERSION_CODE"
+          
+          # Update VERSION_NAME_BASE in config.properties
+          sed -i "s/^VERSION_NAME_BASE=.*/VERSION_NAME_BASE=${{ inputs.base_version }}/" config.properties
+          
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Add updated data files
+          git add config.properties
+          git add app/src/main/assets/firmware_releases.json || true
+          git add app/src/main/assets/device_hardware.json || true
+          git add core/proto || true
+          
+          # Add updated translations (fastlane metadata and strings)
+          git add fastlane/metadata/android || true
+          git add "**/strings.xml" || true
+          
+          # Only commit if there are changes
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): prepare $FINAL_TAG [skip ci]
+
+          - Bump base version to ${{ inputs.base_version }}
+          - Sync translations and assets"
+            git push origin HEAD:${{ github.ref_name }}
+          else
+            echo "No changes to commit."
+          fi
+        shell: bash
+
+      - name: Create and Push Release Tag
+        if: ${{ !inputs.dry_run && inputs.channel == 'internal' }}
+        env:
+          FINAL_TAG: ${{ steps.calculate_tags.outputs.final_tag }}
+        run: |
+          echo "Tagging and pushing release: $FINAL_TAG"
+          git tag "$FINAL_TAG"
+          git push origin "$FINAL_TAG"
+        shell: bash
+
+  call-release-workflow:
+    if: ${{ !inputs.dry_run && inputs.channel == 'internal' }}
+    needs: determine-tags
+    uses: ./.github/workflows/release.yml
+    with:
+      tag_name: ${{ needs.determine-tags.outputs.final_tag }}
+      channel: ${{ inputs.channel }}
+      base_version: ${{ inputs.base_version }}
+    secrets: inherit
+
+  call-promote-workflow:
+    if: ${{ !inputs.dry_run && inputs.channel != 'internal' }}
+    needs: determine-tags
+    uses: ./.github/workflows/promote.yml
+    with:
+      tag_name: ${{ needs.determine-tags.outputs.tag_to_process }}
+      release_name: ${{ needs.determine-tags.outputs.release_name }}
+      final_tag: ${{ needs.determine-tags.outputs.final_tag }}
+      channel: ${{ inputs.channel }}
+      base_version: ${{ inputs.base_version }}
+      from_channel: ${{ needs.determine-tags.outputs.from_channel }}
+    secrets: inherit
