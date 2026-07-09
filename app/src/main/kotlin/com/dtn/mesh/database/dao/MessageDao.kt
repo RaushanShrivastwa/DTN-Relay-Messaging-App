@@ -214,6 +214,21 @@ interface MessageDao {
     /** Find the message currently associated with a Meshtastic packet ID (for ACK correlation). */
     @Query("SELECT * FROM messages WHERE mesh_packet_id = :meshPacketId LIMIT 1")
     suspend fun getByMeshPacketId(meshPacketId: Int): MessageEntity?
+
+    /**
+     * User-visible chat history: every DATA message this device sent or was addressed to
+     * (including broadcasts). Used on startup to repopulate the chat UI so conversations
+     * survive app restarts.
+     */
+    @Query("""
+        SELECT * FROM messages
+        WHERE message_type = 'DATA'
+          AND (origin_node_id = :myNodeId
+               OR destination_node_id = :myNodeId
+               OR destination_node_id = '^all')
+        ORDER BY created_at_ms ASC
+    """)
+    suspend fun getChatHistoryFor(myNodeId: String): List<MessageEntity>
 }
 
 /** Projection for status count aggregation. */

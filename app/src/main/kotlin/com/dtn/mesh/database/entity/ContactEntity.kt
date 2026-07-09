@@ -132,4 +132,11 @@ data class ContactEntity(
     /** Whether this peer is currently reachable (last NODE_CHANGE showed online). */
     @ColumnInfo(name = "is_online")
     val isOnline: Boolean = false,
+
+    /**
+     * User-provided nickname for this peer (shown in chat list / destination selector
+     * when set). Preferred over [longName] and the raw node id for display.
+     */
+    @ColumnInfo(name = "custom_name")
+    val customName: String? = null,
 )

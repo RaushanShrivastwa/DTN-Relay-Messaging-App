@@ -6,6 +6,10 @@ import com.dtn.mesh.database.entity.MessageStatus
 import com.dtn.mesh.model.DtnMessage
 import com.dtn.mesh.model.NodeId
 import com.dtn.mesh.routing.RoutingStrategy
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -21,6 +25,21 @@ class MessageQueueManager @Inject constructor(
     private val messageDao: MessageDao,
     private val config: BufferConfig,
 ) {
+
+    /**
+     * Emitted with the DTN message id every time a message transitions to DELIVERED —
+     * either because we delivered it directly, because a broadcast finished fanning out,
+     * or because a returning receipt confirmed the destination got it.
+     *
+     * The UI listens to this to flip the "buffered" chat bubble to "✓ delivered". A mule
+     * hop does NOT emit here (queueManager.markDelivered is only called on end-delivery),
+     * so relay handoffs correctly stay showing as buffered.
+     */
+    private val _deliveredIds = MutableSharedFlow<String>(
+        extraBufferCapacity = 32,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST,
+    )
+    val deliveredIds: SharedFlow<String> = _deliveredIds.asSharedFlow()
 
     // ──────────────────────────────────────────────────────────────────────
     // Ingest
@@ -160,11 +179,15 @@ class MessageQueueManager @Inject constructor(
     /** Mark a message as delivered (ACK received). */
     suspend fun markDelivered(messageId: String) {
         messageDao.markDelivered(messageId)
+        _deliveredIds.tryEmit(messageId)
     }
 
     /** Mark delivered by Meshtastic packet ID (from MESSAGE_STATUS broadcast). */
     suspend fun markDeliveredByPacketId(meshPacketId: Int) {
+        // Resolve the message id first so we can emit it on the observable.
+        val entity = messageDao.getByMeshPacketId(meshPacketId)
         messageDao.markDeliveredByPacketId(meshPacketId)
+        entity?.id?.let { _deliveredIds.tryEmit(it) }
     }
 
     /** Find which message corresponds to a Meshtastic packet ID. */

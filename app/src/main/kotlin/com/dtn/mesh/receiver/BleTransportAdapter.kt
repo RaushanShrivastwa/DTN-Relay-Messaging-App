@@ -1,3 +1,9 @@
+// File-level suppression — kapt has a long-standing bug where per-method @SuppressLint
+// occasionally emits an empty @SuppressLint() in the generated Java stub, which then fails
+// the Java compile with "annotation is missing a default value for the element 'value'".
+// A single @file:SuppressLint sidesteps the bug and covers every Bluetooth call in this file.
+@file:SuppressLint("MissingPermission")
+
 package com.dtn.mesh.receiver
 
 import android.annotation.SuppressLint
@@ -26,6 +32,11 @@ import com.dtn.mesh.model.DtnMessage
 import com.dtn.mesh.model.LocalNodeIdentity
 import com.dtn.mesh.model.NodeId
 import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -34,6 +45,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 import java.io.ByteArrayOutputStream
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -74,6 +87,16 @@ class BleTransportAdapter @Inject constructor(
 
         private const val DEFAULT_CHUNK = 20 // pre-MTU-negotiation safe size (23 - 3 ATT overhead)
         private const val ENCOUNTER_COOLDOWN_MS = 8_000L // min gap between encounter emits per peer
+        /**
+         * If we haven't seen ANY signal from a peer (scan hit, GATT connect, inbound write,
+         * outbound write) for this long, declare it offline. With LOW_LATENCY scanning +
+         * advertising we get hits every few hundred ms for in-range peers, so a fairly tight
+         * threshold gives near-immediate feedback when a peer hits Disconnect, without the
+         * false-flicker problems the old BALANCED-mode setup had.
+         */
+        private const val PEER_STALE_THRESHOLD_MS = 12_000L
+        /** How often the staleness sweeper wakes up. */
+        private const val SWEEPER_TICK_MS = 2_000L
         private var packetIdCounter = 4_000_000
     }
 
@@ -99,6 +122,17 @@ class BleTransportAdapter @Inject constructor(
     private val readyDevices = ConcurrentHashMap<String, Boolean>()
     /** Address → deferred completed when connection+discovery finishes (or fails). */
     private val connectWaiters = ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Boolean>>()
+
+    /**
+     * NodeId → timestamp of most recent scan callback for that peer. Updated on every scan
+     * hit (not rate-limited like [lastEncounterEmit]) so the staleness sweeper can distinguish
+     * "still advertising" from "went out of range".
+     */
+    private val peerLastSeenMs = ConcurrentHashMap<String, Long>()
+
+    /** Scope for background jobs (staleness sweep). Recreated on each [connect]. */
+    private var adapterScope: CoroutineScope? = null
+    private var sweeperJob: Job? = null
 
     // ── Flows ────────────────────────────────────────────────────────────
 
@@ -129,7 +163,6 @@ class BleTransportAdapter @Inject constructor(
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
-    @SuppressLint("MissingPermission")
     override suspend fun connect(): Boolean {
         val a = adapter ?: run { Log.e(TAG, "No Bluetooth adapter"); return false }
         if (!a.isEnabled) { Log.w(TAG, "Bluetooth is off"); return false }
@@ -139,6 +172,7 @@ class BleTransportAdapter @Inject constructor(
             startGattServer()
             startAdvertising()
             startScanning()
+            startStalenessSweeper()
             _connectionState.value = MeshConnectionState.CONNECTED
             return true
         } catch (e: SecurityException) {
@@ -154,8 +188,9 @@ class BleTransportAdapter @Inject constructor(
         }
     }
 
-    @SuppressLint("MissingPermission")
     override fun disconnect() {
+        runCatching { sweeperJob?.cancel() }; sweeperJob = null
+        runCatching { adapterScope?.cancel() }; adapterScope = null
         runCatching { scanner?.stopScan(scanCallback) }
         runCatching { advertiser?.stopAdvertising(advertiseCallback) }
         clientGatts.values.forEach { runCatching { it.close() } }
@@ -163,14 +198,46 @@ class BleTransportAdapter @Inject constructor(
         runCatching { gattServer?.close() }
         gattServer = null
         deviceForNode.clear(); rxBuffers.clear(); chunkSize.clear()
-        readyDevices.clear(); lastEncounterEmit.clear()
+        readyDevices.clear(); lastEncounterEmit.clear(); peerLastSeenMs.clear()
         connectWaiters.values.forEach { it.complete(false) }; connectWaiters.clear()
         _connectionState.value = MeshConnectionState.DISCONNECTED
     }
 
+    /**
+     * Periodically declares peers we haven't seen recently as offline.
+     *
+     * BLE `onConnectionStateChange(DISCONNECTED)` only fires when there is an active GATT
+     * session; the common case (peer walks out of scan range without a GATT connection) never
+     * triggers it, leaving the remote node stuck showing "online" on other phones. This sweep
+     * emits an isOnline=false encounter after [PEER_STALE_THRESHOLD_MS] of scan silence.
+     */
+    private fun startStalenessSweeper() {
+        val sc = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        adapterScope = sc
+        sweeperJob = sc.launch {
+            while (isActive) {
+                delay(SWEEPER_TICK_MS)
+                val now = System.currentTimeMillis()
+                val stale = peerLastSeenMs.entries.filter { now - it.value > PEER_STALE_THRESHOLD_MS }
+                for ((peerIdStr, _) in stale) {
+                    peerLastSeenMs.remove(peerIdStr)
+                    deviceForNode.remove(peerIdStr)
+                    lastEncounterEmit.remove(peerIdStr)
+                    _nodeEvents.tryEmit(NodeEncounterEvent(
+                        nodeId = NodeId(peerIdStr),
+                        rssi = 0,
+                        snr = 0f,
+                        timestampMs = now,
+                        isOnline = false,
+                    ))
+                    Log.d(TAG, "Peer stale (out of scan range): ${peerIdStr.takeLast(8)}")
+                }
+            }
+        }
+    }
+
     // ── GATT server (peripheral / receive side) ──────────────────────────
 
-    @SuppressLint("MissingPermission")
     private fun startGattServer() {
         val server = bluetoothManager?.openGattServer(context, gattServerCallback) ?: return
         val service = BluetoothGattService(SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY)
@@ -185,7 +252,6 @@ class BleTransportAdapter @Inject constructor(
     }
 
     private val gattServerCallback = object : BluetoothGattServerCallback() {
-        @SuppressLint("MissingPermission")
         override fun onCharacteristicWriteRequest(
             device: BluetoothDevice,
             requestId: Int,
@@ -219,18 +285,26 @@ class BleTransportAdapter @Inject constructor(
         if (bytes.size > 2 + total) buf.write(bytes, 2 + total, bytes.size - (2 + total))
 
         val msg = DtnWireCodec.decode(wire, rssi = -60, snr = 10f) ?: return
+        // A successful decode means the peer is definitely reachable — strongest possible
+        // liveness signal, stronger than an advertisement. Refresh their last-seen so the
+        // sweeper doesn't misfire during an active exchange (which can drown out scan hits).
+        peerLastSeenMs[msg.originNodeId.value] = System.currentTimeMillis()
         _inboundMessages.tryEmit(InboundPacket(message = msg, channel = msg.channel))
     }
 
     // ── Advertising ──────────────────────────────────────────────────────
 
-    @SuppressLint("MissingPermission")
     private fun startAdvertising() {
         val adv = adapter?.bluetoothLeAdvertiser ?: run { Log.w(TAG, "Advertising unsupported"); return }
         advertiser = adv
+        // LOW_LATENCY advertises roughly every 100 ms (vs BALANCED's 250 ms and LOW_POWER's
+        // 1 s). Combined with LOW_LATENCY scanning on the peer side this gives near-immediate
+        // detection and eliminates the "peer flickers offline while still in range" pattern
+        // we saw with BALANCED. Battery cost is real but acceptable while the DTN foreground
+        // service is running.
         val settings = AdvertiseSettings.Builder()
-            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_BALANCED)
-            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_MEDIUM)
+            .setAdvertiseMode(AdvertiseSettings.ADVERTISE_MODE_LOW_LATENCY)
+            .setTxPowerLevel(AdvertiseSettings.ADVERTISE_TX_POWER_HIGH)
             .setConnectable(true)
             .build()
         // Publish our node id (4 bytes) as service data so scanners identify us without connecting.
@@ -251,13 +325,18 @@ class BleTransportAdapter @Inject constructor(
 
     // ── Scanning (central / discover side) ───────────────────────────────
 
-    @SuppressLint("MissingPermission")
     private fun startScanning() {
         val sc = adapter?.bluetoothLeScanner ?: run { Log.w(TAG, "Scanning unsupported"); return }
         scanner = sc
         val filters = listOf(ScanFilter.Builder().setServiceUuid(SERVICE_PARCEL).build())
+        // LOW_LATENCY scans nearly continuously. BALANCED had multi-second gaps between
+        // scan windows, which at edge-of-range meant whole advertisement bursts got missed
+        // and the 25 s staleness threshold tripped. LOW_LATENCY reliably picks up an
+        // advertising peer within a few hundred ms; combined with LOW_LATENCY advertising
+        // on the other side, the offline flicker for in-range peers goes away.
         val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_BALANCED)
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
             .build()
         sc.startScan(filters, settings, scanCallback)
     }
@@ -274,10 +353,14 @@ class BleTransportAdapter @Inject constructor(
 
             deviceForNode[peer.value] = result.device
 
+            val now = System.currentTimeMillis()
+            // Always refresh liveness on any scan hit — the staleness sweeper reads this to
+            // decide when to declare a peer offline. Kept separate from the emit-rate debounce.
+            peerLastSeenMs[peer.value] = now
+
             // Debounce: emit an encounter at most once per ENCOUNTER_COOLDOWN_MS per peer.
             // BLE scan callbacks fire several times per second — without this we flood the
             // orchestrator and thrash connections.
-            val now = System.currentTimeMillis()
             val last = lastEncounterEmit[peer.value] ?: 0L
             if (now - last < ENCOUNTER_COOLDOWN_MS) return
             lastEncounterEmit[peer.value] = now
@@ -297,7 +380,6 @@ class BleTransportAdapter @Inject constructor(
 
     // ── GATT client (send side) ──────────────────────────────────────────
 
-    @SuppressLint("MissingPermission")
     override suspend fun sendMessage(message: DtnMessage, targetPeer: NodeId): Int? {
         // Global guard: any unexpected exception in the send path returns null instead of
         // crashing the orchestrator's consumer coroutine (which would kill all forwarding).
@@ -309,7 +391,6 @@ class BleTransportAdapter @Inject constructor(
         }
     }
 
-    @SuppressLint("MissingPermission")
     private suspend fun sendMessageInternal(message: DtnMessage, targetPeer: NodeId): Int? {
         val device = deviceForNode[targetPeer.value] ?: run {
             Log.w(TAG, "Peer ${targetPeer.value} not in scan range")
@@ -356,13 +437,16 @@ class BleTransportAdapter @Inject constructor(
         }
 
         val pktId = packetIdCounter++
+        // A successful send is the strongest possible liveness signal — mid-transfer we may
+        // not even receive scan advertisements from the peer (the link is busy carrying our
+        // data), so without this refresh the sweeper could false-flag an active peer offline.
+        peerLastSeenMs[targetPeer.value] = System.currentTimeMillis()
         Log.d(TAG, "BLE sent ${framed.size}B to ${targetPeer.value} (pkt=$pktId)")
         _deliveryStatus.tryEmit(DeliveryStatusEvent(meshPacketId = pktId, status = DeliveryOutcome.DELIVERED))
         return pktId
     }
 
     /** Connect (if needed) and wait until services are discovered. */
-    @SuppressLint("MissingPermission")
     private suspend fun ensureReady(device: BluetoothDevice): Boolean {
         // Fast path: already connected and ready
         if (readyDevices[device.address] == true && clientGatts.containsKey(device.address)) return true
@@ -399,7 +483,6 @@ class BleTransportAdapter @Inject constructor(
      * writes are reliable, so we treat a successful writeCharacteristic() as sent.
      */
     @Suppress("DEPRECATION")
-    @SuppressLint("MissingPermission")
     private suspend fun writeChunkAndWait(
         gatt: BluetoothGatt,
         characteristic: BluetoothGattCharacteristic,
@@ -413,10 +496,12 @@ class BleTransportAdapter @Inject constructor(
     }
 
     private val gattClientCallback = object : BluetoothGattCallback() {
-        @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 clientGatts[gatt.device.address] = gatt
+                // Successful GATT connection is a strong liveness signal — refresh so the
+                // sweeper doesn't declare this peer offline while we're mid-transfer.
+                nodeFor(gatt.device.address)?.let { peerLastSeenMs[it.value] = System.currentTimeMillis() }
                 gatt.requestMtu(247)
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 clientGatts.remove(gatt.device.address)
@@ -439,13 +524,11 @@ class BleTransportAdapter @Inject constructor(
             }
         }
 
-        @SuppressLint("MissingPermission")
         override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
             chunkSize[gatt.device.address] = (mtu - 3).coerceAtLeast(DEFAULT_CHUNK)
             gatt.discoverServices()
         }
 
-        @SuppressLint("MissingPermission")
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             val ok = status == BluetoothGatt.GATT_SUCCESS &&
                 gatt.getService(SERVICE_UUID)?.getCharacteristic(BUNDLE_CHAR_UUID) != null

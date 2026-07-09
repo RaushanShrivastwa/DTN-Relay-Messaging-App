@@ -17,14 +17,17 @@ import com.dtn.mesh.model.NodeId
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.DataInputStream
 import java.io.DataOutputStream
@@ -60,6 +63,14 @@ class WifiDirectTransportAdapter @Inject constructor(
         private const val SERVICE_TYPE = "_dtnmesh._tcp"
         /** Peer discovery interval (ms). */
         private const val DISCOVERY_INTERVAL_MS = 15_000L
+        /**
+         * If we haven't heard a HELLO/DATA from a peer within this window, declare it offline.
+         * Longer than the BLE threshold because WiFi Direct is session-based (not continuously
+         * broadcasting) and we can only refresh liveness on actual traffic + heartbeats.
+         */
+        private const val PEER_STALE_THRESHOLD_MS = 30_000L
+        /** How often the staleness sweeper wakes up (also cadence for HELLO heartbeats). */
+        private const val SWEEPER_TICK_MS = 10_000L
         /** Packet ID counter for WiFi Direct sends (local, not Meshtastic). */
         private var packetIdCounter = 2_000_000
     }
@@ -79,6 +90,11 @@ class WifiDirectTransportAdapter @Inject constructor(
     private val discoveredPeers = mutableMapOf<String, WifiP2pDevice>()
     /** Connected peers we can send to. Maps NodeId string → peer IP address. */
     private val connectedPeers = mutableMapOf<String, String>()
+    /** NodeId → timestamp of most recent activity from that peer. Used by the sweeper. */
+    private val peerLastSeenMs = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
+    /** Job for the staleness sweep loop. */
+    private var sweeperJob: Job? = null
 
     // ── Flows ────────────────────────────────────────────────────────────
 
@@ -126,6 +142,7 @@ class WifiDirectTransportAdapter @Inject constructor(
             registerP2pReceivers()
             startPeerDiscovery()
             startServerSocket()
+            startStalenessSweeper()
             return true
         } catch (e: SecurityException) {
             Log.e(TAG, "WiFi Direct permission missing: ${e.message}")
@@ -142,14 +159,75 @@ class WifiDirectTransportAdapter @Inject constructor(
 
     override fun disconnect() {
         Log.i(TAG, "Stopping WiFi Direct")
+        runCatching { sweeperJob?.cancel() }; sweeperJob = null
         stopDiscovery()
         unregisterP2pReceivers()
         serverSocket?.close()
         serverSocket = null
         connectedPeers.clear()
         discoveredPeers.clear()
+        peerLastSeenMs.clear()
         _connectionState.value = MeshConnectionState.DISCONNECTED
     }
+
+    /**
+     * Periodically declares peers we haven't heard from as offline, and emits HELLO
+     * heartbeats to keep the mapping alive during otherwise-idle sessions.
+     *
+     * WiFi Direct is session-based (not continuously broadcasting like BLE scan-adv), so a
+     * long silent connection would otherwise trigger false-offline events. We refresh
+     * [peerLastSeenMs] on every inbound HELLO/DATA in [handleIncomingConnection] and on
+     * every outbound HELLO here — real disconnects still hit the threshold after
+     * [PEER_STALE_THRESHOLD_MS] with no traffic in either direction.
+     */
+    private fun startStalenessSweeper() {
+        sweeperJob = scope.launch {
+            while (isActive) {
+                delay(SWEEPER_TICK_MS)
+                val now = System.currentTimeMillis()
+
+                // 1) Fire HELLO heartbeats to every known peer to prove we're still alive.
+                //    If the socket connect fails we DON'T refresh their timestamp, so the
+                //    sweeper still sees them as stale after PEER_STALE_THRESHOLD_MS.
+                for ((peerId, ip) in connectedPeers.toMap()) {
+                    scope.launch {
+                        val ok = sendHelloAsync(ip)
+                        if (ok) peerLastSeenMs[peerId] = System.currentTimeMillis()
+                    }
+                }
+
+                // 2) Reap peers we haven't heard from for too long.
+                val stale = peerLastSeenMs.entries.filter { now - it.value > PEER_STALE_THRESHOLD_MS }
+                for ((peerId, _) in stale) {
+                    peerLastSeenMs.remove(peerId)
+                    connectedPeers.remove(peerId)
+                    _nodeEvents.tryEmit(NodeEncounterEvent(
+                        nodeId = NodeId(peerId),
+                        rssi = 0,
+                        snr = 0f,
+                        timestampMs = now,
+                        isOnline = false,
+                    ))
+                    Log.d(TAG, "Peer stale (no activity): ${peerId.takeLast(8)}")
+                }
+            }
+        }
+    }
+
+    /** Blocking-style HELLO used by the sweeper; returns true if the socket write succeeded. */
+    private fun sendHelloAsync(peerIp: String): Boolean = try {
+        val myId = identity.nodeId.value.toByteArray()
+        Socket().use { sock ->
+            sock.connect(InetSocketAddress(peerIp, DTN_P2P_PORT), 3000)
+            DataOutputStream(sock.getOutputStream()).apply {
+                writeInt(0)
+                writeInt(myId.size)
+                write(myId)
+                flush()
+            }
+        }
+        true
+    } catch (_: Exception) { false }
 
     @SuppressLint("MissingPermission")
     private fun startPeerDiscovery() {
@@ -216,6 +294,8 @@ class WifiDirectTransportAdapter @Inject constructor(
             // HELLO the first time we see this peer so the mapping becomes bidirectional.
             val isNewPeer = !connectedPeers.containsKey(senderId)
             if (remoteIp != null) connectedPeers[senderId] = remoteIp
+            // Refresh liveness for the sweeper on any HELLO or DATA from this peer.
+            peerLastSeenMs[senderId] = System.currentTimeMillis()
             if (isNewPeer && remoteIp != null) {
                 _nodeEvents.tryEmit(NodeEncounterEvent(
                     nodeId = fromNode,

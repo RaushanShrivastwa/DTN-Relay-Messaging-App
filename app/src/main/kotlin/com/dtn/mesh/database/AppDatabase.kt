@@ -27,7 +27,10 @@ import com.dtn.mesh.database.entity.MessageEntity
         EncounterEntity::class,
         ForwardingDecisionEntity::class,
     ],
-    version = 1,
+    // v2: added ContactEntity.custom_name column (user-provided nickname per peer).
+    // fallbackToDestructiveMigration is set in DatabaseModule so existing data is wiped on upgrade
+    // — acceptable for research prototype; wire a proper migration before field deployment.
+    version = 2,
     exportSchema = true,
 )
 @TypeConverters(Converters::class)

@@ -113,7 +113,15 @@ interface ContactDao {
     @Query("UPDATE contacts SET is_online = 0 WHERE node_id = :nodeId")
     suspend fun markOffline(nodeId: String)
 
-    /** Mark all peers as offline (e.g. on disconnect from Meshtastic). */
+    /**
+     * Mark peer as online. Used unconditionally on every ONLINE encounter so a peer that
+     * comes back after being marked offline flips green immediately, without depending on
+     * the "isNew encounter" branch in the orchestrator.
+     */
+    @Query("UPDATE contacts SET is_online = 1 WHERE node_id = :nodeId")
+    suspend fun markOnline(nodeId: String)
+
+    /** Mark all peers as offline (e.g. on our own disconnect — we can no longer prove liveness). */
     @Query("UPDATE contacts SET is_online = 0")
     suspend fun markAllOffline()
 
@@ -169,4 +177,17 @@ interface ContactDao {
         WHERE node_id = :nodeId
     """)
     suspend fun updateNodeInfo(nodeId: String, longName: String?, shortName: String?, hwModel: String?)
+
+    /** Set (or clear when [name] is null/blank) the user-provided nickname for a peer. */
+    @Query("UPDATE contacts SET custom_name = :name WHERE node_id = :nodeId")
+    suspend fun updateCustomName(nodeId: String, name: String?)
+
+    /**
+     * Refresh the most recent signal metrics for a peer. Lighter-weight than
+     * [recordEncounter] which also increments the encounter counter; used on every online
+     * event so the RSSI-based signal bars in the UI track continuously, not only on the
+     * first encounter of each contact window.
+     */
+    @Query("UPDATE contacts SET last_rssi = :rssi, last_snr = :snr WHERE node_id = :nodeId")
+    suspend fun updateSignal(nodeId: String, rssi: Int, snr: Float)
 }

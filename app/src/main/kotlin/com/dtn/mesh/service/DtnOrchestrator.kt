@@ -58,6 +58,11 @@ class DtnOrchestrator @Inject constructor(
         /** Each UUID = 16 bytes; max receipts per bundle = MAX_SINGLE_PACKET_PAYLOAD / 16. */
         private const val UUID_BYTES = 16
         private const val MAX_RECEIPTS_PER_BUNDLE = DtnMessage.MAX_SINGLE_PACKET_PAYLOAD / UUID_BYTES // 13
+        /**
+         * If we sent a message to a peer but got no receipt within this window, allow a
+         * retransmit on the next flush. Handles silent BLE drops without spamming the peer.
+         */
+        private const val SEND_RETRY_INTERVAL_MS = 30_000L
     }
 
     private sealed class OrchestratorEvent {
@@ -68,29 +73,65 @@ class DtnOrchestrator @Inject constructor(
         data object FlushBuffer : OrchestratorEvent()
     }
 
-    private val eventChannel = Channel<OrchestratorEvent>(capacity = Channel.BUFFERED)
-    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+    /**
+     * Nullable + `var` so start()/stop() can be called repeatedly without leaking state.
+     * On stop() we close the channel and cancel the scope, then null them out. On the
+     * next start() we allocate fresh instances. Public entry points use ?.trySend so a
+     * send arriving between stop() and start() is silently dropped instead of crashing.
+     */
+    private var eventChannel: Channel<OrchestratorEvent>? = null
+    private var scope: CoroutineScope? = null
     private var isRunning = false
 
-    /** Tracks which peers already received which messages (echo prevention). */
-    private val sentTo = java.util.concurrent.ConcurrentHashMap<String, MutableSet<String>>()
+    /**
+     * When we last sent each (message, peer) pair. Not a boolean "already sent" flag any
+     * more — a bare-boolean lockout meant that if BLE silently dropped a fire-and-forget
+     * write, we'd never retry. Entries expire after [SEND_RETRY_INTERVAL_MS] so the next
+     * flush cycle can retransmit if the receipt never came back.
+     */
+    private val sentTo = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentHashMap<String, Long>>()
+
     private fun markSentTo(msgId: String, peer: String) {
-        sentTo.getOrPut(msgId) { java.util.concurrent.ConcurrentHashMap.newKeySet() }.add(peer)
+        sentTo.getOrPut(msgId) { java.util.concurrent.ConcurrentHashMap() }[peer] = System.currentTimeMillis()
     }
-    private fun alreadySentTo(msgId: String, peer: String): Boolean =
-        sentTo[msgId]?.contains(peer) == true
+
+    /** True if we sent this msg to this peer recently and shouldn't yet retry. */
+    private fun recentlySentTo(msgId: String, peer: String): Boolean {
+        val last = sentTo[msgId]?.get(peer) ?: return false
+        return System.currentTimeMillis() - last < SEND_RETRY_INTERVAL_MS
+    }
+
+    /** Drop tracking for a message that is no longer in our buffer (delivered / expired). */
+    private fun forgetSentTo(msgId: String) {
+        sentTo.remove(msgId)
+    }
+
+    /**
+     * Drop tracking for every message we sent to [peer]. Called when a peer transitions
+     * offline so that a subsequent reconnection retries immediately instead of waiting
+     * out the SEND_RETRY_INTERVAL_MS — receipts might have been lost with the drop, and a
+     * duplicate send is safe (the peer's ingest deduplicates by message id).
+     */
+    private fun forgetSentToPeer(peer: String) {
+        for ((_, peers) in sentTo) peers.remove(peer)
+    }
 
     // ── Lifecycle ────────────────────────────────────────────────────────
 
     fun start() {
         if (isRunning) return
+        // Fresh channel + scope on every start — the previous ones (if any) were closed/cancelled.
+        val ch = Channel<OrchestratorEvent>(capacity = Channel.BUFFERED)
+        val sc = CoroutineScope(Dispatchers.IO + SupervisorJob())
+        eventChannel = ch
+        scope = sc
         isRunning = true
         Log.i(TAG, "Started")
-        scope.launch { transport.nodeEvents.collect { eventChannel.send(OrchestratorEvent.Encounter(it)) } }
-        scope.launch { transport.inboundMessages.collect { eventChannel.send(OrchestratorEvent.Message(it)) } }
-        scope.launch { transport.deliveryStatus.collect { eventChannel.send(OrchestratorEvent.Status(it)) } }
-        scope.launch {
-            for (ev in eventChannel) {
+        sc.launch { transport.nodeEvents.collect { ch.trySend(OrchestratorEvent.Encounter(it)) } }
+        sc.launch { transport.inboundMessages.collect { ch.trySend(OrchestratorEvent.Message(it)) } }
+        sc.launch { transport.deliveryStatus.collect { ch.trySend(OrchestratorEvent.Status(it)) } }
+        sc.launch {
+            for (ev in ch) {
                 try {
                     when (ev) {
                         is OrchestratorEvent.Encounter -> onPeerEvent(ev.event)
@@ -109,17 +150,21 @@ class DtnOrchestrator @Inject constructor(
     fun stop() {
         if (!isRunning) return
         isRunning = false
-        eventChannel.close()
-        scope.cancel()
+        runCatching { eventChannel?.close() }
+        runCatching { scope?.cancel() }
+        eventChannel = null
+        scope = null
         Log.i(TAG, "Stopped")
     }
 
-    suspend fun enqueueBatchQUpdates(d: List<ForwardingDecisionEntity>) {
-        if (isRunning) eventChannel.send(OrchestratorEvent.QUpdateBatch(d))
+    /** Non-suspending: uses trySend so callers never crash on a stopped orchestrator. */
+    fun enqueueBatchQUpdates(d: List<ForwardingDecisionEntity>) {
+        eventChannel?.trySend(OrchestratorEvent.QUpdateBatch(d))
     }
 
-    suspend fun triggerFlush() {
-        if (isRunning) eventChannel.send(OrchestratorEvent.FlushBuffer)
+    /** Non-suspending: uses trySend so callers never crash on a stopped orchestrator. */
+    fun triggerFlush() {
+        eventChannel?.trySend(OrchestratorEvent.FlushBuffer)
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -135,11 +180,23 @@ class DtnOrchestrator @Inject constructor(
                 if (enc.endTimeMs == 0L) encounterDao.closeEncounter(enc.id, System.currentTimeMillis())
             }
             queueManager.revertForwardingForPeer(peerId)
+            // We don't know whether the peer received the messages we sent before dropping
+            // — if the receipt was lost with the connection, we want to retry the moment
+            // they reappear rather than sitting on the 30 s retry timer.
+            forgetSentToPeer(peerId.value)
             Log.d(TAG, "OFFLINE: ${peerId.value.takeLast(8)}")
             return
         }
 
         contactDao.insertIfNew(ContactEntity(nodeId = peerId.value))
+        // Always flip to online on any live encounter. recordEncounter below also sets this,
+        // but is gated by the `isNew` novelty check — without this, a peer that was marked
+        // offline (by the staleness sweeper or by our own disconnect) can stay showing red
+        // in the UI even while we're actively receiving from them.
+        contactDao.markOnline(peerId.value)
+        // Keep the RSSI signal bars fresh — recordEncounter only fires on novel encounters,
+        // so without this, the UI's signal indicator would stick to a stale value.
+        contactDao.updateSignal(peerId.value, event.rssi, event.snr)
         if (event.longName != null || event.shortName != null) {
             contactDao.updateNodeInfo(peerId.value, event.longName, event.shortName, event.hwModel)
         }
@@ -174,6 +231,15 @@ class DtnOrchestrator @Inject constructor(
     private suspend fun flushToOnlinePeers() {
         val peers = contactDao.getOnlineContacts()
         if (peers.isEmpty()) return
+
+        // Piggy-back delivery receipts on every flush, not just on the initial online event.
+        // Without this, receipts only propagate when a peer first comes online (or after an
+        // offline/online cycle), which meant mules held onto delivered messages for minutes
+        // waiting for the next encounter tick. Now Send / Sync / any RX also pushes receipts.
+        for (peer in peers) {
+            runCatching { sendDeliveryReceipts(NodeId(peer.nodeId)) }
+                .onFailure { Log.w(TAG, "receipt push to ${peer.nodeId.takeLast(8)} failed", it) }
+        }
 
         val snapshot = queueManager.getAllBuffered()
         if (snapshot.isEmpty()) return
@@ -217,13 +283,16 @@ class DtnOrchestrator @Inject constructor(
     ) {
         var sentCount = 0
         for (msg in snapshot) {
-            // Skip if we know this msg has already been delivered somewhere (via receipt)
+            // If a receipt already confirmed delivery elsewhere, drop this copy locally.
             if (receiptStore.isDelivered(msg.id) && msg.destinationNodeId != NodeId.BROADCAST) {
                 queueManager.markDelivered(msg.id)
+                forgetSentTo(msg.id)
                 continue
             }
             if (msg.originNodeId.value == peerId.value) continue
-            if (alreadySentTo(msg.id, peerId.value)) continue
+            // Skip peers we recently sent to. After SEND_RETRY_INTERVAL_MS we'll retry —
+            // this handles silently-dropped BLE writes without spamming a working link.
+            if (recentlySentTo(msg.id, peerId.value)) continue
 
             val isBroadcast = msg.destinationNodeId == NodeId.BROADCAST
             val isDirectDelivery = msg.destinationNodeId.value == peerId.value
@@ -239,12 +308,20 @@ class DtnOrchestrator @Inject constructor(
 
             when {
                 isDirectDelivery -> {
-                    queueManager.markDelivered(msg.id)
-                    receiptStore.markDelivered(msg.id)
-                    Log.d(TAG, "DELIVERED: ${msg.id.take(8)} → ${peerId.value.takeLast(8)}")
+                    // Fire-and-forget BLE is NOT proof of delivery — Android reports success
+                    // as soon as the write is queued to the radio, before the peer has
+                    // acknowledged anything. Marking the message delivered here caused the
+                    // sender's buffer to clear even when the peer never actually received
+                    // the bytes. Instead we wait for the recipient's return-path receipt to
+                    // arrive (see processInboundReceipts). If the receipt never comes back
+                    // within SEND_RETRY_INTERVAL_MS, the sentTo entry expires and this loop
+                    // retransmits on the next flush.
+                    Log.d(TAG, "SENT-DIRECT: ${msg.id.take(8)} → ${peerId.value.takeLast(8)} (awaiting receipt)")
                 }
                 isBroadcast -> {
-                    // Just fan out — outer loop clears after every peer got it.
+                    // Broadcasts don't have a single destination to receipt from — the
+                    // completion condition is "reached every currently online peer this
+                    // cycle" and the outer loop clears them.
                     broadcastsToClear.add(msg.id)
                     Log.d(TAG, "BCAST → ${peerId.value.takeLast(8)}: ${msg.id.take(8)}")
                 }
@@ -325,6 +402,8 @@ class DtnOrchestrator @Inject constructor(
                 queueManager.markDelivered(uuid)
                 cleared++
             }
+            // The message is done — drop any retry-tracking state for it.
+            forgetSentTo(uuid)
         }
         if (cleared > 0) Log.d(TAG, "RECEIPTS-IN: $cleared msgs cleared from buffer")
     }
@@ -354,6 +433,11 @@ class DtnOrchestrator @Inject constructor(
                 queueManager.markDelivered(msg.id)
                 receiptStore.markDelivered(msg.id) // we now have a receipt to propagate
                 Log.d(TAG, "RX-MINE: ${msg.id.take(8)} from ${msg.originNodeId.value.takeLast(8)}")
+                // Propagate the fresh receipt immediately — without this the sender's
+                // chat bubble stays "buffered" until our next natural flush cycle, which
+                // could be seconds to tens of seconds away. flushToOnlinePeers also sends
+                // any pending buffered messages, which is a no-op if we have none.
+                flushToOnlinePeers()
             }
             return
         }
