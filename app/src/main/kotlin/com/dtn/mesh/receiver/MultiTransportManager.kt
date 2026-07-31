@@ -105,11 +105,26 @@ class MultiTransportManager @Inject constructor(
         updateConnectionState()
     }
 
+    /**
+     * Aggressive on-demand liveness check triggered by the UI Refresh button.
+     * Any peer we haven't received a fresh signal from in the last 3 seconds is
+     * marked offline immediately — this catches peers whose app has hit Disconnect
+     * (they stopped advertising the DTN service UUID) even though the OS-level
+     * Bluetooth radio is still on and the cached scan record hasn't naturally aged out.
+     */
+    fun forceStalenessCheck() {
+        bleTransport.forceStalenessCheck()
+    }
+
     // ── Send ─────────────────────────────────────────────────────────────
 
     /**
      * Send via the best available transport for the target peer.
      * Priority: BLE (if a live BLE neighbor) > WiFi Direct (if a P2P neighbor) > LoRa hub.
+     * Fallback: if no direct transport reaches the peer, hand to the LoRa hub anyway —
+     * the hub will flood the bundle across the backbone and deliver it to whichever phone
+     * has registered with that node id. Without this fallback, receipts addressed to a
+     * remote phone id never leave the local radio because isHub(phone_id) returns false.
      */
     override suspend fun sendMessage(message: DtnMessage, targetPeer: NodeId): Int? {
         // 1. BLE — primary P2P, no airtime cost, coexists with hub WiFi.
@@ -126,10 +141,21 @@ class MultiTransportManager @Inject constructor(
             }
         }
 
-        // 3. LoRa hub — long-haul backbone (peer is the hub itself).
+        // 3. LoRa hub — long-haul backbone. Primary case: targetPeer is the hub itself.
         if (loRaHubTransport.isConnected && loRaHubTransport.isHub(targetPeer)) {
             loRaHubTransport.sendMessage(message, targetPeer)?.let {
                 Log.d(TAG, "Handed to LoRa hub for ${targetPeer.value}"); return it
+            }
+        }
+
+        // 4. LoRa hub relay fallback — the target isn't a hub and isn't reachable via BLE
+        //    or WiFi Direct, but if a hub is connected we can hand off to it for flooding.
+        //    The hub will deliver to the destination phone if it's connected to any hub in
+        //    the mesh. This is critical for delivery receipts (ROUTING_ACK bundles addressed
+        //    to a remote phone node id) to propagate back through the backbone.
+        if (loRaHubTransport.isConnected) {
+            loRaHubTransport.sendMessage(message, targetPeer)?.let {
+                Log.d(TAG, "Relayed via LoRa hub to ${targetPeer.value}"); return it
             }
         }
 

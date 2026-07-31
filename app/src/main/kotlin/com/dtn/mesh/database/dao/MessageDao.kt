@@ -54,6 +54,14 @@ interface MessageDao {
     @Query("SELECT COUNT(*) FROM messages WHERE status = '${MessageStatus.BUFFERED}'")
     fun observeBufferedCount(): Flow<Int>
 
+    /** Reactive flow of all currently-buffered message entities (for the Network tab). */
+    @Query("""
+        SELECT * FROM messages 
+        WHERE status IN ('${MessageStatus.BUFFERED}', '${MessageStatus.FORWARDING}')
+        ORDER BY received_at_ms DESC
+    """)
+    fun observeBufferedMessages(): Flow<List<MessageEntity>>
+
     /** Total payload bytes currently buffered — for buffer occupancy calculation. */
     @Query("""
         SELECT COALESCE(SUM(payload_size_bytes), 0) FROM messages 
@@ -165,6 +173,14 @@ interface MessageDao {
     /** Increment duplicate count for an existing message. */
     @Query("UPDATE messages SET duplicate_count = duplicate_count + 1 WHERE id = :messageId")
     suspend fun incrementDuplicateCount(messageId: String)
+
+    /**
+     * Bump the per-message forward counter used by the PROPHET two-stage router.
+     * Unlike [markForwarding] this does NOT change status — a mule copy that we've handed
+     * off can and should still be considered for further mules until a receipt clears it.
+     */
+    @Query("UPDATE messages SET forward_count = forward_count + 1 WHERE id = :messageId")
+    suspend fun incrementForwardCount(messageId: String)
 
     // ──────────────────────────────────────────────────────────────────────
     // TTL / Garbage collection

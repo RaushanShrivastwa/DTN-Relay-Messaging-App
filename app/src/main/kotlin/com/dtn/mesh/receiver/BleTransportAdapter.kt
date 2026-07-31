@@ -89,14 +89,12 @@ class BleTransportAdapter @Inject constructor(
         private const val ENCOUNTER_COOLDOWN_MS = 8_000L // min gap between encounter emits per peer
         /**
          * If we haven't seen ANY signal from a peer (scan hit, GATT connect, inbound write,
-         * outbound write) for this long, declare it offline. With LOW_LATENCY scanning +
-         * advertising we get hits every few hundred ms for in-range peers, so a fairly tight
-         * threshold gives near-immediate feedback when a peer hits Disconnect, without the
-         * false-flicker problems the old BALANCED-mode setup had.
+         * outbound write) for this long, declare it offline. 20s balances responsiveness
+         * against false-positives on devices where the OS throttles BLE scan duty cycle.
          */
-        private const val PEER_STALE_THRESHOLD_MS = 12_000L
+        private const val PEER_STALE_THRESHOLD_MS = 20_000L
         /** How often the staleness sweeper wakes up. */
-        private const val SWEEPER_TICK_MS = 2_000L
+        private const val SWEEPER_TICK_MS = 4_000L
         private var packetIdCounter = 4_000_000
     }
 
@@ -200,6 +198,7 @@ class BleTransportAdapter @Inject constructor(
         deviceForNode.clear(); rxBuffers.clear(); chunkSize.clear()
         readyDevices.clear(); lastEncounterEmit.clear(); peerLastSeenMs.clear()
         connectWaiters.values.forEach { it.complete(false) }; connectWaiters.clear()
+        chunkAckWaiters.values.forEach { it.complete(false) }; chunkAckWaiters.clear()
         _connectionState.value = MeshConnectionState.DISCONNECTED
     }
 
@@ -217,22 +216,51 @@ class BleTransportAdapter @Inject constructor(
         sweeperJob = sc.launch {
             while (isActive) {
                 delay(SWEEPER_TICK_MS)
-                val now = System.currentTimeMillis()
-                val stale = peerLastSeenMs.entries.filter { now - it.value > PEER_STALE_THRESHOLD_MS }
-                for ((peerIdStr, _) in stale) {
-                    peerLastSeenMs.remove(peerIdStr)
-                    deviceForNode.remove(peerIdStr)
-                    lastEncounterEmit.remove(peerIdStr)
-                    _nodeEvents.tryEmit(NodeEncounterEvent(
-                        nodeId = NodeId(peerIdStr),
-                        rssi = 0,
-                        snr = 0f,
-                        timestampMs = now,
-                        isOnline = false,
-                    ))
-                    Log.d(TAG, "Peer stale (out of scan range): ${peerIdStr.takeLast(8)}")
-                }
+                runStalenessCheck(PEER_STALE_THRESHOLD_MS)
             }
+        }
+    }
+
+    /**
+     * Immediately check every tracked peer against a caller-supplied threshold and emit
+     * offline events for stale ones. Called by the Refresh button in the UI with an
+     * aggressive short threshold (~3 s) — since we scan with SCAN_MODE_LOW_LATENCY every
+     * in-range peer emits advertisements every ~100–500 ms, so 3 seconds of scan silence
+     * reliably means the peer stopped advertising (their app hit Disconnect, even if the
+     * OS BLE radio is still on).
+     */
+    fun forceStalenessCheck(thresholdMs: Long = 3_000L) {
+        runStalenessCheck(thresholdMs)
+    }
+
+    /** Shared body of the sweeper and the manual refresh, threshold-parameterised. */
+    private fun runStalenessCheck(thresholdMs: Long) {
+        val now = System.currentTimeMillis()
+        val stale = peerLastSeenMs.entries.filter { now - it.value > thresholdMs }
+        for ((peerIdStr, _) in stale) {
+            // Capture the BluetoothDevice before we drop the mapping so we can tear down
+            // its GATT session by MAC address. Without this, a cached GATT connection to
+            // a peer whose app has hit Disconnect can silently accept writes at the LL
+            // layer while the DTN service is gone — the "fake ACK" scenario.
+            val staleDevice = deviceForNode.remove(peerIdStr)
+            peerLastSeenMs.remove(peerIdStr)
+            lastEncounterEmit.remove(peerIdStr)
+            staleDevice?.address?.let { addr ->
+                connectWaiters.remove(addr)?.complete(false)
+                chunkAckWaiters.remove(addr)?.complete(false)
+                clientGatts.remove(addr)?.let { runCatching { it.close() } }
+                readyDevices.remove(addr)
+                chunkSize.remove(addr)
+                rxBuffers.remove(addr)
+            }
+            _nodeEvents.tryEmit(NodeEncounterEvent(
+                nodeId = NodeId(peerIdStr),
+                rssi = 0,
+                snr = 0f,
+                timestampMs = now,
+                isOnline = false,
+            ))
+            Log.d(TAG, "Peer stale (threshold=${thresholdMs}ms): ${peerIdStr.takeLast(8)}")
         }
     }
 
@@ -475,12 +503,23 @@ class BleTransportAdapter @Inject constructor(
     }
 
     /**
-     * Write one chunk using WRITE_TYPE_NO_RESPONSE (fire-and-forget) with light pacing.
+     * Per-device deferreds that resolve when the peer's ATT layer acknowledges a write.
+     * Populated before `writeCharacteristic` returns, completed inside
+     * [gattClientCallback.onCharacteristicWrite].
+     */
+    private val chunkAckWaiters =
+        ConcurrentHashMap<String, kotlinx.coroutines.CompletableDeferred<Boolean>>()
+
+    /**
+     * Write one chunk with WRITE_TYPE_DEFAULT (write-with-response) and wait for the
+     * peer's ATT ACK. This is the only way to know whether the peer actually received
+     * the bytes — with WRITE_TYPE_NO_RESPONSE Android reports success as soon as the
+     * write is queued to the radio, which fooled the delivery layer into marking
+     * messages as delivered even when the receiver's DTN GATT server was gone (app
+     * disconnected but Bluetooth still on).
      *
-     * We deliberately do NOT wait for onCharacteristicWrite: on many devices that ack is
-     * delayed or missing even when the data was actually delivered, which caused sends to be
-     * falsely reported as failed (message stuck in buffer). Over a connected GATT link small
-     * writes are reliable, so we treat a successful writeCharacteristic() as sent.
+     * Timeout is generous but bounded (2 s) so we don't hang forever on an unresponsive
+     * peer.
      */
     @Suppress("DEPRECATION")
     private suspend fun writeChunkAndWait(
@@ -488,11 +527,24 @@ class BleTransportAdapter @Inject constructor(
         characteristic: BluetoothGattCharacteristic,
         data: ByteArray,
     ): Boolean {
-        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
+        val addr = gatt.device.address
+        // Any previous waiter for this device is stale — release it as failed.
+        chunkAckWaiters.remove(addr)?.complete(false)
+
+        val waiter = kotlinx.coroutines.CompletableDeferred<Boolean>()
+        chunkAckWaiters[addr] = waiter
+
+        characteristic.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
         characteristic.value = data
-        val ok = gatt.writeCharacteristic(characteristic)
-        if (ok) kotlinx.coroutines.delay(40) // pace between chunks so the stack keeps up
-        return ok
+        val queued = gatt.writeCharacteristic(characteristic)
+        if (!queued) {
+            chunkAckWaiters.remove(addr)
+            return false
+        }
+        // Real end-to-end confirmation: we ONLY report success if the peer ATT-acked.
+        val acked = kotlinx.coroutines.withTimeoutOrNull(2_000L) { waiter.await() } ?: false
+        chunkAckWaiters.remove(addr)
+        return acked
     }
 
     private val gattClientCallback = object : BluetoothGattCallback() {
@@ -507,8 +559,10 @@ class BleTransportAdapter @Inject constructor(
                 clientGatts.remove(gatt.device.address)
                 readyDevices.remove(gatt.device.address)
                 runCatching { gatt.close() }
-                // Fail any in-flight waiter for this device
+                // Fail any in-flight waiters for this device — connect handshake and
+                // pending chunk ACKs both need to unblock so the send path returns null.
                 connectWaiters.remove(gatt.device.address)?.complete(false)
+                chunkAckWaiters.remove(gatt.device.address)?.complete(false)
                 // Emit offline event so orchestrator + UI know this peer is gone
                 val peer = nodeFor(gatt.device.address)
                 if (peer != null) {
@@ -542,7 +596,15 @@ class BleTransportAdapter @Inject constructor(
             characteristic: BluetoothGattCharacteristic,
             status: Int,
         ) {
-            // Not used — writes are fire-and-forget (WRITE_TYPE_NO_RESPONSE).
+            // Complete the pending waiter for this device — this is the real end-to-end
+            // confirmation. status != GATT_SUCCESS means the peer rejected the write
+            // (e.g. no matching characteristic → their DTN service is gone) or the link
+            // died mid-write. Either way it's a real "not delivered" signal.
+            val ok = status == BluetoothGatt.GATT_SUCCESS
+            chunkAckWaiters.remove(gatt.device.address)?.complete(ok)
+            if (!ok) {
+                Log.w(TAG, "onCharacteristicWrite FAILED status=$status for ${gatt.device.address}")
+            }
         }
     }
 

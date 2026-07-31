@@ -13,12 +13,16 @@ import com.dtn.mesh.model.DtnMessage
 import com.dtn.mesh.model.DtnMessageType
 import com.dtn.mesh.model.ForwardingAction
 import com.dtn.mesh.model.NodeId
+import com.dtn.mesh.model.ContactRecord
 import com.dtn.mesh.queue.MessageQueueManager
 import com.dtn.mesh.receiver.DeliveryOutcome
 import com.dtn.mesh.receiver.DeliveryStatusEvent
 import com.dtn.mesh.receiver.InboundPacket
 import com.dtn.mesh.receiver.MeshTransport
 import com.dtn.mesh.receiver.NodeEncounterEvent
+import com.dtn.mesh.routing.RadioDistanceEstimator
+import com.dtn.mesh.routing.RoutingSummary
+import com.dtn.mesh.routing.StrategySelector
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -52,6 +56,8 @@ class DtnOrchestrator @Inject constructor(
     private val contactDao: ContactDao,
     private val encounterDao: EncounterDao,
     private val decisionDao: ForwardingDecisionDao,
+    private val strategySelector: StrategySelector,
+    private val lifecycle: MessageLifecycleLog,
 ) {
     companion object {
         private const val TAG = "DtnOrchestrator"
@@ -215,11 +221,65 @@ class DtnOrchestrator @Inject constructor(
 
         Log.d(TAG, "ONLINE: ${peerId.value.takeLast(8)}")
 
+        // Feed the routing strategy so PROPHET's P-table (and MaxProp's path likelihoods)
+        // learn from this contact. Distance is derived from the observed RSSI via the
+        // log-distance path-loss model — if RSSI is unavailable the estimator returns the
+        // "unknown" sentinel and the distance-boost term is skipped.
+        val distanceM = RadioDistanceEstimator.estimateMeters(
+            rssi = event.rssi,
+            transport = RadioDistanceEstimator.Transport.BLE, // TODO: source per-encounter when multi-transport metadata lands
+        )
+        strategySelector.onEncounter(
+            peerId = peerId,
+            contactRecord = ContactRecord(
+                peerId = peerId,
+                startTimeMs = event.timestampMs,
+                rssi = event.rssi,
+                snr = event.snr,
+                distanceMeters = distanceM,
+            ),
+        )
+
+        // Exchange routing summaries so both sides can drive Stage-2 (smart-spread)
+        // decisions based on the peer's own predictability table.
+        sendRoutingSummary(peerId)
+
         // Send our delivery receipts to the peer (so their buffer can clear).
         sendDeliveryReceipts(peerId)
 
         // Then attempt to send our buffered messages to this peer.
         sendBufferedTo(peerId)
+    }
+
+    /**
+     * Push our current PROPHET P-vector (or MaxProp equivalent) to the peer so their
+     * Stage-2 forwarding decisions have accurate `P(peer, dest)` values to compare against.
+     * The summary is sent as an ephemeral [DtnMessageType.ROUTING_SUMMARY] bundle — it is
+     * never persisted in the peer's forwarding buffer.
+     */
+    private suspend fun sendRoutingSummary(peerId: NodeId) {
+        val summary = strategySelector.buildRoutingSummary()
+        if (summary.payload.isEmpty()) return
+        // Guard: the summary is a self-describing binary vector — truncating mid-entry
+        // would give the peer a corrupt payload that fails to decode. Rather than send
+        // garbage, skip until a smaller summary is available. A future improvement can
+        // send top-K entries or fragment across multiple bundles.
+        if (summary.payload.size > DtnMessage.MAX_SINGLE_PACKET_PAYLOAD) {
+            Log.w(TAG, "Routing summary too large (${summary.payload.size} B) — skipping this cycle")
+            return
+        }
+        val myId = transport.localNodeId ?: NodeId.LOCAL
+        val bundle = DtnMessage(
+            id = UUID.randomUUID().toString(),
+            originNodeId = myId,
+            destinationNodeId = peerId,
+            payloadBytes = summary.payload,
+            createdAtMs = System.currentTimeMillis(),
+            ttlMs = 300_000L, // 5 min — short-lived control traffic
+            messageType = DtnMessageType.ROUTING_SUMMARY,
+        )
+        runCatching { transport.sendMessage(bundle, peerId) }
+            .onFailure { Log.w(TAG, "routing-summary push to ${peerId.value.takeLast(8)} failed", it) }
     }
 
     /**
@@ -281,51 +341,101 @@ class DtnOrchestrator @Inject constructor(
         snapshot: List<DtnMessage>,
         broadcastsToClear: MutableSet<String>,
     ) {
+        // Build the strategy approval set for RELAY candidates only. Direct delivery and
+        // broadcasts are NEVER subject to strategy veto — they always go through.
+        val onlinePeerIds = try {
+            contactDao.getOnlineContacts().map { it.nodeId }.toSet()
+        } catch (_: Exception) { emptySet<String>() }
+
+        val relayApproved: Set<String> = try {
+            val prophet = strategySelector.active as? com.dtn.mesh.routing.ProphetStrategy
+            if (prophet != null) {
+                prophet.rankForForwardingWithTopology(snapshot, peerId, onlinePeerIds)
+                    .map { it.message.id }.toSet()
+            } else {
+                strategySelector.rankForForwarding(snapshot, peerId).map { it.message.id }.toSet()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "rankForForwarding threw, falling back to unfiltered", e)
+            snapshot.map { it.id }.toSet()
+        }
+
         var sentCount = 0
         for (msg in snapshot) {
-            // If a receipt already confirmed delivery elsewhere, drop this copy locally.
+            // If a receipt already confirmed delivery elsewhere, clear locally.
             if (receiptStore.isDelivered(msg.id) && msg.destinationNodeId != NodeId.BROADCAST) {
                 queueManager.markDelivered(msg.id)
                 forgetSentTo(msg.id)
                 continue
             }
+            // Don't echo back to the original sender.
             if (msg.originNodeId.value == peerId.value) continue
-            // Skip peers we recently sent to. After SEND_RETRY_INTERVAL_MS we'll retry —
-            // this handles silently-dropped BLE writes without spamming a working link.
-            if (recentlySentTo(msg.id, peerId.value)) continue
 
             val isBroadcast = msg.destinationNodeId == NodeId.BROADCAST
             val isDirectDelivery = msg.destinationNodeId.value == peerId.value
 
-            val ok = transport.sendMessage(msg, peerId)
+            // Rate-limit check — but NEVER for direct delivery (dest is RIGHT HERE, send it!)
+            if (!isDirectDelivery && !isBroadcast && recentlySentTo(msg.id, peerId.value)) continue
+
+            // Strategy veto applies ONLY to relay (mule) traffic. Direct and broadcast bypass.
+            if (!isDirectDelivery && !isBroadcast && msg.id !in relayApproved) {
+                continue
+            }
+
+            // Send with hop incremented.
+            val wireMsg = msg.copy(hopCount = (msg.hopCount + 1).coerceAtMost(255))
+            val ok = transport.sendMessage(wireMsg, peerId)
             if (ok == null) {
                 Log.w(TAG, "FAIL: ${peerId.value.takeLast(8)} unreachable")
-                break
+                break // transport failed — stop trying this peer for now
             }
 
             markSentTo(msg.id, peerId.value)
+            runCatching { queueManager.incrementForwardCount(msg.id) }
             sentCount++
 
+            val myId = transport.localNodeId?.value ?: ""
             when {
                 isDirectDelivery -> {
-                    // Fire-and-forget BLE is NOT proof of delivery — Android reports success
-                    // as soon as the write is queued to the radio, before the peer has
-                    // acknowledged anything. Marking the message delivered here caused the
-                    // sender's buffer to clear even when the peer never actually received
-                    // the bytes. Instead we wait for the recipient's return-path receipt to
-                    // arrive (see processInboundReceipts). If the receipt never comes back
-                    // within SEND_RETRY_INTERVAL_MS, the sentTo entry expires and this loop
-                    // retransmits on the next flush.
-                    Log.d(TAG, "SENT-DIRECT: ${msg.id.take(8)} → ${peerId.value.takeLast(8)} (awaiting receipt)")
+                    // BLE direct delivery: the GATT link is established and the write
+                    // succeeded — reliable connection, so mark delivered immediately.
+                    queueManager.markDelivered(msg.id)
+                    forgetSentTo(msg.id)
+                    lifecycle.log(LifecycleEvent.FORWARDED, msg.id,
+                        origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
+                        hopCount = wireMsg.hopCount, forwardCount = msg.forwardCount + 1,
+                        ttlRemainingMs = msg.remainingTtlMs(),
+                        extra = "DIRECT→${peerId.value.takeLast(8)} ✓delivered")
+                    lifecycle.recordOutgoing(
+                        msgId = msg.id, source = msg.originNodeId.value,
+                        dest = msg.destinationNodeId.value, me = myId,
+                        nextHop = peerId.value, delivered = true,
+                    )
+                    Log.d(TAG, "DELIVERED-DIRECT: ${msg.id.take(8)} → ${peerId.value.takeLast(8)}")
                 }
                 isBroadcast -> {
-                    // Broadcasts don't have a single destination to receipt from — the
-                    // completion condition is "reached every currently online peer this
-                    // cycle" and the outer loop clears them.
                     broadcastsToClear.add(msg.id)
+                    lifecycle.log(LifecycleEvent.FORWARDED, msg.id,
+                        origin = msg.originNodeId.value, dest = "BROADCAST",
+                        hopCount = wireMsg.hopCount, forwardCount = msg.forwardCount + 1,
+                        extra = "BCAST→${peerId.value.takeLast(8)}")
+                    lifecycle.recordOutgoing(
+                        msgId = msg.id, source = msg.originNodeId.value,
+                        dest = "^all", me = myId,
+                        nextHop = peerId.value, delivered = false,
+                    )
                     Log.d(TAG, "BCAST → ${peerId.value.takeLast(8)}: ${msg.id.take(8)}")
                 }
                 else -> {
+                    lifecycle.log(LifecycleEvent.FORWARDED, msg.id,
+                        origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
+                        hopCount = wireMsg.hopCount, forwardCount = msg.forwardCount + 1,
+                        extra = "RELAY→${peerId.value.takeLast(8)}")
+                    lifecycle.recordOutgoing(
+                        msgId = msg.id, source = msg.originNodeId.value,
+                        dest = msg.destinationNodeId.value, me = myId,
+                        nextHop = peerId.value, delivered = false,
+                    )
                     Log.d(TAG, "RELAYED: ${msg.id.take(8)} → mule ${peerId.value.takeLast(8)}")
                 }
             }
@@ -397,9 +507,12 @@ class DtnOrchestrator @Inject constructor(
             val off = i * UUID_BYTES
             val bb = java.nio.ByteBuffer.wrap(payload, off, UUID_BYTES)
             val uuid = UUID(bb.long, bb.long).toString()
+            lifecycle.log(LifecycleEvent.ACK_RECEIVED, uuid,
+                origin = msg.originNodeId.value, extra = "from=${msg.originNodeId.value.takeLast(8)}")
             receiptStore.markDelivered(uuid)
             if (queueManager.existsInBuffer(uuid)) {
                 queueManager.markDelivered(uuid)
+                lifecycle.log(LifecycleEvent.BUFFER_CLEARED, uuid)
                 cleared++
             }
             // The message is done — drop any retry-tracking state for it.
@@ -420,6 +533,22 @@ class DtnOrchestrator @Inject constructor(
             processInboundReceipts(msg)
             return
         }
+
+        // Routing summary from a peer — feed to strategy for transitivity + peer-P cache.
+        if (msg.messageType == DtnMessageType.ROUTING_SUMMARY) {
+            runCatching {
+                strategySelector.onRoutingSummaryReceived(
+                    peerId = msg.originNodeId,
+                    summary = RoutingSummary(
+                        strategyTag = com.dtn.mesh.routing.ProphetStrategy.TAG,
+                        payload = msg.payloadBytes,
+                    ),
+                )
+                Log.d(TAG, "ROUTING-SUMMARY-IN from ${msg.originNodeId.value.takeLast(8)}")
+            }.onFailure { Log.w(TAG, "routing-summary decode failed from ${msg.originNodeId.value}", it) }
+            return
+        }
+
         if (!msg.messageType.isUserData) return
 
         val myId = transport.localNodeId?.value
@@ -432,12 +561,36 @@ class DtnOrchestrator @Inject constructor(
             if (stored) {
                 queueManager.markDelivered(msg.id)
                 receiptStore.markDelivered(msg.id) // we now have a receipt to propagate
+                lifecycle.log(LifecycleEvent.DELIVERED, msg.id,
+                    origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
+                    hopCount = msg.hopCount, ttlRemainingMs = msg.remainingTtlMs())
+                lifecycle.recordIncoming(
+                    msgId = msg.id, source = msg.originNodeId.value,
+                    dest = msg.destinationNodeId.value,
+                    prevHop = msg.originNodeId.value,
+                    me = transport.localNodeId?.value ?: "",
+                    delivered = true,
+                )
+                lifecycle.log(LifecycleEvent.ACK_GENERATED, msg.id,
+                    extra = "will push to ${contactDao.getOnlineContacts().size} online peers")
                 Log.d(TAG, "RX-MINE: ${msg.id.take(8)} from ${msg.originNodeId.value.takeLast(8)}")
-                // Propagate the fresh receipt immediately — without this the sender's
-                // chat bubble stays "buffered" until our next natural flush cycle, which
-                // could be seconds to tens of seconds away. flushToOnlinePeers also sends
-                // any pending buffered messages, which is a no-op if we have none.
+                // Propagate the fresh receipt immediately
                 flushToOnlinePeers()
+            } else {
+                // DUPLICATE — we already have this message. But the sender clearly never
+                // got our ACK (otherwise they wouldn't re-send). If we have a receipt for
+                // this msgId, push it again immediately so the sender's buffer clears.
+                if (receiptStore.isDelivered(msg.id)) {
+                    lifecycle.log(LifecycleEvent.DUPLICATE, msg.id,
+                        origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
+                        extra = "already delivered — re-pushing ACK")
+                    Log.d(TAG, "DUP-MINE: ${msg.id.take(8)} — re-sending ACK to clear sender buffer")
+                    flushToOnlinePeers()
+                } else {
+                    lifecycle.log(LifecycleEvent.DUPLICATE, msg.id,
+                        origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
+                        extra = "already ingested")
+                }
             }
             return
         }
@@ -451,6 +604,13 @@ class DtnOrchestrator @Inject constructor(
         val stored = queueManager.ingest(msg)
         if (stored) {
             Log.d(TAG, "RX-MULE: ${msg.id.take(8)} → dest ${msg.destinationNodeId.value.takeLast(8)}")
+            lifecycle.recordIncoming(
+                msgId = msg.id, source = msg.originNodeId.value,
+                dest = msg.destinationNodeId.value,
+                prevHop = msg.originNodeId.value,
+                me = transport.localNodeId?.value ?: "",
+                delivered = false,
+            )
             // Try to deliver onward immediately if destination is online.
             flushToOnlinePeers()
         }
@@ -461,8 +621,13 @@ class DtnOrchestrator @Inject constructor(
     // ══════════════════════════════════════════════════════════════════════
 
     private suspend fun onDeliveryStatus(event: DeliveryStatusEvent) {
+        // NOTE: Transport-level delivery status (e.g. BLE write success) is a HOP-level
+        // signal, NOT end-to-end delivery proof. We intentionally do NOT clear the buffer
+        // from this signal — only from explicit receipts (ROUTING_ACK) or direct delivery
+        // confirmation in sendToSingle. This avoids the bug where a relay handoff to a
+        // mule was incorrectly treated as final delivery.
         if (event.status == DeliveryOutcome.DELIVERED) {
-            queueManager.markDeliveredByPacketId(event.meshPacketId)
+            Log.d(TAG, "HOP-ACK: pktId=${event.meshPacketId} (informational only)")
         }
     }
 

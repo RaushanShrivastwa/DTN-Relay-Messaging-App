@@ -17,4 +17,11 @@ data class ContactRecord(
     val snr: Float,
     /** Number of packets exchanged during this encounter. */
     val packetCount: Int = 1,
+    /**
+     * Estimated physical distance to the peer in metres, derived from RSSI via the
+     * log-distance path-loss model. `-1.0` means "unknown / not measured" — routing
+     * strategies must treat that as a signal to skip any distance-aware boost so a
+     * missing reading doesn't corrupt the predictability table.
+     */
+    val distanceMeters: Double = -1.0,
 )

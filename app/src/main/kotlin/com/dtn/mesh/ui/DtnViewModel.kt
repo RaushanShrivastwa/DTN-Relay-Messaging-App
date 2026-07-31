@@ -38,6 +38,7 @@ class DtnViewModel @Inject constructor(
     private val exporter: ResearchExporter,
     private val contactDao: ContactDao,
     private val messageDao: MessageDao,
+    private val lifecycleLog: com.dtn.mesh.service.MessageLifecycleLog,
 ) : AndroidViewModel(application) {
 
     companion object {
@@ -58,8 +59,18 @@ class DtnViewModel @Inject constructor(
     val bufferedCount: StateFlow<Int> = queueManager.observeBufferedCount()
         .stateIn(viewModelScope, SharingStarted.Eagerly, 0)
 
+    /** Live list of all currently-buffered messages (for the Network tab). */
+    val bufferedMessages: StateFlow<List<BufferedMsgInfo>> = queueManager.observeBufferedMessages()
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
     private val _exportPath = MutableStateFlow<String?>(null)
     val exportPath: StateFlow<String?> = _exportPath.asStateFlow()
+
+    /** Message lifecycle events for the dedicated Lifecycle page. */
+    val lifecycleEntries: StateFlow<List<com.dtn.mesh.service.LifecycleEntry>> = lifecycleLog.entries
+
+    /** Per-message hop routes for the Network tab. */
+    val messageRoutes: StateFlow<List<com.dtn.mesh.service.MessageLifecycleLog.RouteRecord>> = lifecycleLog.routes
 
     private val _activeStrategy = MutableStateFlow("PROPHET")
     val activeStrategy: StateFlow<String> = _activeStrategy.asStateFlow()
@@ -367,6 +378,15 @@ class DtnViewModel @Inject constructor(
                 val isBroadcast = dest == NodeId.BROADCAST
                 val target = if (isBroadcast) "ALL" else dest.value.takeLast(8)
                 addLog("QUEUED: \"$text\" → $target (${msg.id.take(8)})")
+                lifecycleLog.log(com.dtn.mesh.service.LifecycleEvent.CREATED, msg.id,
+                    origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
+                    ttlRemainingMs = msg.ttlMs)
+                lifecycleLog.log(com.dtn.mesh.service.LifecycleEvent.BUFFERED, msg.id,
+                    origin = msg.originNodeId.value, dest = msg.destinationNodeId.value)
+                lifecycleLog.recordAsOrigin(msg.id,
+                    source = msg.originNodeId.value,
+                    dest = msg.destinationNodeId.value,
+                    me = msg.originNodeId.value)
                 _receivedMessages.value = _receivedMessages.value + ChatMessage(
                     msgId = msg.id,
                     text = text,
@@ -402,6 +422,33 @@ class DtnViewModel @Inject constructor(
             runCatching { orchestrator.triggerFlush() }
                 .onFailure { Log.e(TAG, "triggerFlush failed", it) }
         }
+    }
+
+    /**
+     * Force refresh online/offline status for all peers.
+     * Runs an aggressive 3-second staleness check on the BLE transport — any peer whose
+     * scan advertisements have stopped arriving in the last 3s gets marked offline
+     * immediately. This catches the "peer's app is disconnected but their Bluetooth is
+     * still on" scenario where cached scan records would otherwise keep them showing
+     * green for up to 20 seconds.
+     */
+    fun refreshPeerStatus() {
+        viewModelScope.launch {
+            addLog("Refreshing peer status (3s aggressive check)...")
+            val mgr = transport as? com.dtn.mesh.receiver.MultiTransportManager
+            mgr?.forceStalenessCheck()
+            // Also push any pending receipts / buffered messages while we're here.
+            runCatching { orchestrator.triggerFlush() }
+                .onFailure { Log.e(TAG, "triggerFlush failed on refresh", it) }
+        }
+    }
+
+    /** Current PROPHET P-values for display in the Network tab. */
+    fun getProbabilities(): Map<String, Double> {
+        return try {
+            val prophet = strategySelector.active as? com.dtn.mesh.routing.ProphetStrategy
+            prophet?.getPTable() ?: emptyMap()
+        } catch (_: Exception) { emptyMap() }
     }
 
     /** Manually clear the buffer (force-drop all pending messages). */
@@ -482,3 +529,15 @@ data class PeerInfo(
             ?: longName?.takeIf { it.isNotBlank() }
             ?: nodeId.takeLast(8)
 }
+
+/** Buffered message info for the Network dashboard. */
+data class BufferedMsgInfo(
+    val msgId: String,
+    val origin: String,
+    val dest: String,
+    val hopCount: Int,
+    val forwardCount: Int,
+    val ttlMin: Long,
+    val bufferedFor: Long,  // seconds
+    val status: String,
+)

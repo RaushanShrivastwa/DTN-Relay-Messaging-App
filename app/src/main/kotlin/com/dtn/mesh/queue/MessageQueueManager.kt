@@ -10,6 +10,7 @@ import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.map
 import javax.inject.Inject
 import javax.inject.Singleton
 
@@ -161,6 +162,15 @@ class MessageQueueManager @Inject constructor(
         messageDao.markForwarding(messageId, peerId.value, meshPacketId)
     }
 
+    /**
+     * Bump the per-message forward counter without changing message status.
+     * Used by the PROPHET router each time we hand a copy to a mule so the counter
+     * can drive the Stage-1 / Stage-2 transition on subsequent flushes.
+     */
+    suspend fun incrementForwardCount(messageId: String) {
+        messageDao.incrementForwardCount(messageId)
+    }
+
     /** Revert all FORWARDING messages targeted at a specific peer back to BUFFERED.
      *  Called when a peer goes offline mid-transfer. */
     suspend fun revertForwardingForPeer(peerId: NodeId) {
@@ -169,6 +179,15 @@ class MessageQueueManager @Inject constructor(
 
     /** Manually clear the buffer — mark all active messages DROPPED. Returns count cleared. */
     suspend fun clearBuffer(): Int = messageDao.clearAllActive()
+
+    /**
+     * Mark a specific list of messages as DROPPED (used by the housekeeping worker when a
+     * message's delivery probability has decayed below the reachability threshold).
+     */
+    suspend fun dropMessages(ids: List<String>) {
+        if (ids.isEmpty()) return
+        messageDao.markDropped(ids)
+    }
 
     /** Check if a message exists in BUFFERED state. */
     suspend fun existsInBuffer(messageId: String): Boolean {
@@ -197,6 +216,23 @@ class MessageQueueManager @Inject constructor(
     /** Reactive count of currently BUFFERED messages (for UI). */
     fun observeBufferedCount(): kotlinx.coroutines.flow.Flow<Int> =
         messageDao.observeBufferedCount()
+
+    /** Reactive list of currently buffered messages for the Network dashboard. */
+    fun observeBufferedMessages(): kotlinx.coroutines.flow.Flow<List<com.dtn.mesh.ui.BufferedMsgInfo>> =
+        messageDao.observeBufferedMessages().map { entities ->
+            entities.map { e ->
+                com.dtn.mesh.ui.BufferedMsgInfo(
+                    msgId = e.id.take(8),
+                    origin = e.originNodeId.takeLast(8),
+                    dest = if (e.destinationNodeId == "^all") "BROADCAST" else e.destinationNodeId.takeLast(8),
+                    hopCount = e.hopCount,
+                    forwardCount = e.forwardCount,
+                    ttlMin = ((e.expiresAtMs - System.currentTimeMillis()) / 60_000L).coerceAtLeast(0),
+                    bufferedFor = ((System.currentTimeMillis() - e.receivedAtMs) / 1000L).coerceAtLeast(0),
+                    status = e.status,
+                )
+            }
+        }
 
     // ──────────────────────────────────────────────────────────────────────
     // Entity ↔ DTO conversion
