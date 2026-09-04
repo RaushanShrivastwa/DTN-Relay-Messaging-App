@@ -9,6 +9,8 @@ import com.dtn.mesh.database.dao.ForwardingDecisionDao
 import com.dtn.mesh.queue.MessageQueueManager
 import com.dtn.mesh.routing.StrategySelector
 import com.dtn.mesh.service.DtnOrchestrator
+import com.dtn.mesh.service.LifecycleEvent
+import com.dtn.mesh.service.MessageLifecycleLog
 import dagger.assisted.Assisted
 import dagger.assisted.AssistedInject
 
@@ -33,6 +35,7 @@ class ForwardingWorker @AssistedInject constructor(
     private val strategySelector: StrategySelector,
     private val decisionDao: ForwardingDecisionDao,
     private val orchestrator: DtnOrchestrator,
+    private val lifecycle: MessageLifecycleLog,
 ) : CoroutineWorker(context, params) {
 
     companion object {
@@ -43,7 +46,18 @@ class ForwardingWorker @AssistedInject constructor(
     override suspend fun doWork(): Result {
         Log.d(TAG, "Housekeeping cycle starting")
 
-        // Phase 1: TTL expiry
+        // Phase 1: TTL expiry. Log each message about to expire BEFORE the DB marks it, so the
+        // lifecycle feed / buffer-history show why it left the buffer (previously these were
+        // only Log.d and never surfaced in-app).
+        runCatching {
+            queueManager.getAllBuffered()
+                .filter { it.remainingTtlMs() <= 0L }
+                .forEach { m ->
+                    lifecycle.log(LifecycleEvent.EXPIRED, m.id,
+                        origin = m.originNodeId.value, dest = m.destinationNodeId.value,
+                        hopCount = m.hopCount, extra = "TTL reached")
+                }
+        }
         val expired = queueManager.expireMessages()
         if (expired > 0) Log.d(TAG, "Expired $expired messages")
 
@@ -83,6 +97,10 @@ class ForwardingWorker @AssistedInject constructor(
                 val p = prophet.getDeliveryProbability(msg.destinationNodeId)
                 if (p < prophet.config.pMinThreshold) {
                     dropIds.add(msg.id)
+                    lifecycle.log(LifecycleEvent.DROPPED, msg.id,
+                        origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
+                        hopCount = msg.hopCount,
+                        extra = "low reachability P=${"%.3f".format(p)} < ${prophet.config.pMinThreshold}")
                 }
             }
             if (dropIds.isNotEmpty()) {

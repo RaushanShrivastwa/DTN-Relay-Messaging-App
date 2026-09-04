@@ -54,6 +54,8 @@ class MessageLifecycleLog @Inject constructor() {
         val nextHop: String? = null,
         val delivered: Boolean = false,
         val timestampMs: Long = System.currentTimeMillis(),
+        /** Routing algorithm active when this node last forwarded the message (e.g. "PROPHET"). */
+        val strategy: String = "",
     ) {
         /** Human-readable view: `source → prevHop → me → nextHop`, omitting nulls. */
         fun asPath(): String = buildString {
@@ -74,6 +76,16 @@ class MessageLifecycleLog @Inject constructor() {
     val routes: StateFlow<List<RouteRecord>> = _routes.asStateFlow()
 
     private val timeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+
+    /**
+     * Guards the read-modify-write of [_entries] and [_routes]. Both are updated from multiple
+     * threads (GATT server callback on RX, orchestrator dispatcher on TX/forward), and the
+     * "read value → build new list → set value" sequence is not atomic. Without this lock two
+     * threads could each miss an existing route for the same message id and both prepend a new
+     * record — producing two entries with the same key, which crashes the Compose LazyColumn
+     * ("Key X was already used"). Serialising the mutations removes the duplication at the source.
+     */
+    private val lock = Any()
 
     fun log(
         event: LifecycleEvent,
@@ -96,7 +108,9 @@ class MessageLifecycleLog @Inject constructor() {
             ttlRemainingMin = if (ttlRemainingMs > 0) (ttlRemainingMs / 60_000L).toInt() else -1,
             extra = extra,
         )
-        _entries.value = (listOf(entry) + _entries.value).take(MAX_ENTRIES)
+        synchronized(lock) {
+            _entries.value = (listOf(entry) + _entries.value).take(MAX_ENTRIES)
+        }
         Log.d(TAG, entry.toLogLine())
     }
 
@@ -145,6 +159,7 @@ class MessageLifecycleLog @Inject constructor() {
      */
     fun recordOutgoing(
         msgId: String, source: String, dest: String, me: String, nextHop: String, delivered: Boolean,
+        strategy: String = "",
     ) {
         upsertRoute(msgId) { existing ->
             val base = existing ?: newRecord(msgId, source, dest, me)
@@ -154,20 +169,27 @@ class MessageLifecycleLog @Inject constructor() {
                 me = me.takeLast(8),
                 nextHop = nextHop.takeLast(8),
                 delivered = base.delivered || delivered,
+                strategy = strategy.ifBlank { base.strategy },
             )
         }
     }
 
-    private inline fun upsertRoute(msgId: String, mutate: (RouteRecord?) -> RouteRecord) {
+    private fun upsertRoute(msgId: String, mutate: (RouteRecord?) -> RouteRecord) {
         val key = msgId.take(8)
-        val current = _routes.value.toMutableList()
-        val idx = current.indexOfFirst { it.msgId == key }
-        val updated = if (idx >= 0) mutate(current[idx]) else mutate(null)
-        if (idx >= 0) {
-            current[idx] = updated
-            _routes.value = current
-        } else {
-            _routes.value = (listOf(updated) + current).take(MAX_ROUTES)
+        // Entire read-modify-write must be atomic: concurrent RX (recordIncoming) and TX
+        // (recordOutgoing) for the same message would otherwise both see idx == -1 and each
+        // prepend a fresh record with the same msgId key — the exact duplicate-key that
+        // crashes the route LazyColumn.
+        synchronized(lock) {
+            val current = _routes.value.toMutableList()
+            val idx = current.indexOfFirst { it.msgId == key }
+            val updated = if (idx >= 0) mutate(current[idx]) else mutate(null)
+            if (idx >= 0) {
+                current[idx] = updated
+                _routes.value = current
+            } else {
+                _routes.value = (listOf(updated) + current).take(MAX_ROUTES)
+            }
         }
     }
 
@@ -194,6 +216,9 @@ enum class LifecycleEvent {
     DELIVERED,
     EXPIRED,
     HOP_LIMIT,
+
+    /** Removed from the buffer without delivery by the housekeeping policy (low P / buffer pressure). */
+    DROPPED,
 }
 
 data class LifecycleEntry(

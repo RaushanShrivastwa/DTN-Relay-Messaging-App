@@ -258,6 +258,16 @@ class DtnViewModel @Inject constructor(
             com.dtn.mesh.service.DtnForegroundService.start(getApplication())
             val success = transport.connect()
             if (success) {
+                // Start the orchestrator directly rather than relying solely on the
+                // foreground service's onCreate. The service start is async and can be
+                // delayed (or fail before reaching orchestrator.start() if startForeground
+                // throws), which left the orchestrator's encounter->contacts persistence
+                // never running: peers showed up in the raw NODE log (this ViewModel
+                // collects transport.nodeEvents directly) but never appeared in the chat /
+                // peer list, which is driven by the Room contacts table written only in
+                // DtnOrchestrator.onPeerEvent. start() is idempotent, so the service
+                // calling it too is a harmless no-op.
+                orchestrator.start()
                 addLog("Transports initiated — foreground service running")
                 _localNodeId.value = transport.localNodeId?.value
                 // Now that we (probably) know our id, try loading chat history if init couldn't.
@@ -415,6 +425,107 @@ class DtnViewModel @Inject constructor(
         addLog("Strategy switched to ${newType.name}")
     }
 
+    /** Explicitly select a routing protocol from the UI switch. [typeName] is "PROPHET" or "MAXPROP". */
+    fun setStrategy(typeName: String) {
+        val type = runCatching { StrategySelector.StrategyType.valueOf(typeName) }
+            .getOrDefault(StrategySelector.StrategyType.PROPHET)
+        if (type == strategySelector.activeType) return
+        strategySelector.switchTo(type)
+        _activeStrategy.value = type.name
+        addLog("Strategy set to ${type.name}")
+    }
+
+    /**
+     * Build a human-readable breakdown of how PROPHET would route toward [destNodeId]:
+     * my own delivery predictability P(me,dest), each online peer's belief P(peer,dest), the
+     * 2-hop path likelihood through them P(me,peer)·P(peer,dest), and the transitive gain each
+     * would contribute to my table. Returns null when the active strategy isn't PROPHET
+     * (MaxProp uses a different cost model) or the destination is blank/broadcast.
+     */
+    fun explainRoute(destNodeId: String): RoutingExplanation? {
+        if (destNodeId.isBlank() || destNodeId == "^all" || destNodeId == NodeId.BROADCAST.value) return null
+        val dest = NodeId(destNodeId)
+        val candidates = peerList.value.filter { it.nodeId != destNodeId }
+
+        return when (val active = strategySelector.active) {
+            is com.dtn.mesh.routing.ProphetStrategy -> {
+                val cfg = active.config
+                val myP = active.getDeliveryProbability(dest)
+                val beliefs = candidates.map { peer ->
+                    val pMeToNode = active.getDeliveryProbability(NodeId(peer.nodeId))
+                    val pNodeToDest = active.peerDeliveryProbability(NodeId(peer.nodeId), dest)
+                    val pathVia = pMeToNode * pNodeToDest
+                    val gain = (1.0 - myP) * pMeToNode * pNodeToDest * cfg.betaTransitivity
+                    RoutingNodeBelief(
+                        nodeId = peer.nodeId,
+                        displayName = peer.displayName(),
+                        isOnline = peer.isOnline,
+                        score = pathVia,
+                        detail = "P(me→node) ${fmt(pMeToNode)} · P(node→dest) ${fmt(pNodeToDest)} · +transit ${fmt(gain)}",
+                    )
+                }.sortedByDescending { it.score }
+                val best = beliefs.firstOrNull { it.score > 0.0 }
+                RoutingExplanation(
+                    dest = destNodeId,
+                    strategy = "PROPHET",
+                    myScore = myP,
+                    myScoreLabel = "P(me → dest)",
+                    beliefs = beliefs,
+                    bestNextHop = best?.nodeId,
+                    bestNextHopName = best?.displayName,
+                    bestScore = best?.score ?: 0.0,
+                    bestScoreLabel = "P_path",
+                    formulas = listOf(
+                        FormulaItem("Direct encounter", "P(a,b) = P + (1−P)·P_init + ε^d"),
+                        FormulaItem("Transitivity", "P(a,c) += (1−P(a,c))·P(a,b)·P(b,c)·β"),
+                        FormulaItem("Aging", "P(a,b) = P(a,b)·γ^k"),
+                        FormulaItem("2-hop path", "P_path(via j) = P(me,j)·P(j,dest)"),
+                    ),
+                    constantsLine = "P_init=${fmt2(cfg.pEncounter)} · β=${fmt2(cfg.betaTransitivity)} · " +
+                        "γ=${fmt2(cfg.gammaAging)} · path floor=${fmt2(cfg.pFloorPath)}",
+                )
+            }
+            is com.dtn.mesh.routing.MaxPropStrategy -> {
+                val cfg = active.config
+                val fDest = active.getDeliveryProbability(dest) // f(me, dest)
+                val beliefs = candidates.map { peer ->
+                    val fPeer = active.getDeliveryProbability(NodeId(peer.nodeId)) // f(me, peer)
+                    RoutingNodeBelief(
+                        nodeId = peer.nodeId,
+                        displayName = peer.displayName(),
+                        isOnline = peer.isOnline,
+                        score = fPeer,
+                        detail = "f(me→node) ${fmt(fPeer)} · est. cost ${fmt(1.0 - fPeer)}",
+                    )
+                }.sortedByDescending { it.score }
+                val best = beliefs.firstOrNull { it.score > 0.0 }
+                RoutingExplanation(
+                    dest = destNodeId,
+                    strategy = "MAXPROP",
+                    myScore = fDest,
+                    myScoreLabel = "f(me → dest)",
+                    beliefs = beliefs,
+                    bestNextHop = best?.nodeId,
+                    bestNextHopName = best?.displayName,
+                    bestScore = best?.score ?: 0.0,
+                    bestScoreLabel = "f",
+                    formulas = listOf(
+                        FormulaItem("Path likelihood", "f(i,j) = encounters(j) / Σ encounters"),
+                        FormulaItem("Delivery cost", "cost(dest) = 1 − f(dest)  (lower = better)"),
+                        FormulaItem("Transitivity", "f(i,k) ← peer f(j,k) · discount (if unknown)"),
+                        FormulaItem("Recency decay", "count ← count · decay each cycle"),
+                    ),
+                    constantsLine = "discount=${fmt2(cfg.transitivityDiscount)} · " +
+                        "recency decay=${fmt2(cfg.recencyDecayFactor)}",
+                )
+            }
+            else -> null
+        }
+    }
+
+    private fun fmt(v: Double): String = "%.3f".format(v)
+    private fun fmt2(v: Double): String = "%.2f".format(v)
+
     /** Manually retry sending all buffered messages to online peers. */
     fun syncBuffer() {
         viewModelScope.launch {
@@ -529,6 +640,36 @@ data class PeerInfo(
             ?: longName?.takeIf { it.isNotBlank() }
             ?: nodeId.takeLast(8)
 }
+
+/** One candidate carrier's score toward a destination, strategy-agnostic for the UI. */
+data class RoutingNodeBelief(
+    val nodeId: String,
+    val displayName: String,
+    val isOnline: Boolean,
+    /** Primary ranking score for this carrier (PROPHET: P_path; MaxProp: f(me,node)). */
+    val score: Double,
+    /** Pre-formatted secondary detail line explaining how [score] was derived. */
+    val detail: String,
+)
+
+/** A named formula shown in the "Formulas & constants" breakdown. */
+data class FormulaItem(val label: String, val formula: String)
+
+/** Full explanation of how the active strategy scores routes toward one destination. */
+data class RoutingExplanation(
+    val dest: String,
+    val strategy: String,
+    /** My own score toward the destination (PROPHET P(me,dest); MaxProp f(me,dest)). */
+    val myScore: Double,
+    val myScoreLabel: String,
+    val beliefs: List<RoutingNodeBelief>,
+    val bestNextHop: String?,
+    val bestNextHopName: String?,
+    val bestScore: Double,
+    val bestScoreLabel: String,
+    val formulas: List<FormulaItem>,
+    val constantsLine: String,
+)
 
 /** Buffered message info for the Network dashboard. */
 data class BufferedMsgInfo(

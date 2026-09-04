@@ -34,7 +34,7 @@ import kotlin.math.max
  * Zero Android dependencies. Pure Kotlin.
  */
 class MaxPropStrategy(
-    private val config: MaxPropConfig = MaxPropConfig(),
+    val config: MaxPropConfig = MaxPropConfig(),
 ) : RoutingStrategy {
 
     override val name: String = "MAXPROP"

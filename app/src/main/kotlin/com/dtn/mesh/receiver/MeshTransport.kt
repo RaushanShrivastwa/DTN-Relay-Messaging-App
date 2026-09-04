@@ -110,6 +110,14 @@ data class InboundPacket(
     val channel: Int,
     /** Timestamp of reception at the local device (epoch ms). */
     val receivedAtMs: Long = System.currentTimeMillis(),
+    /**
+     * The immediate previous hop we received this bundle from, when the transport can
+     * identify it (BLE resolves it from the writer's advertised node id). Null when the
+     * transport can't attribute a sender (e.g. LoRa hub flood). Used by the orchestrator to
+     * avoid the reverse-echo bug — re-sending a bundle straight back to whoever just gave it
+     * to us, which wastes half-duplex BLE airtime and stalls forward progress in a chain.
+     */
+    val viaPeer: NodeId? = null,
 )
 
 /**

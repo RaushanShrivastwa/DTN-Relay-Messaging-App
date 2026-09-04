@@ -290,7 +290,7 @@ class BleTransportAdapter @Inject constructor(
             value: ByteArray,
         ) {
             if (characteristic.uuid == BUNDLE_CHAR_UUID) {
-                accumulateInbound(device.address, value)
+                accumulateInbound(device, value)
             }
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
@@ -299,7 +299,8 @@ class BleTransportAdapter @Inject constructor(
     }
 
     /** Append inbound bytes for a device and extract complete bundles. */
-    private fun accumulateInbound(address: String, value: ByteArray) {
+    private fun accumulateInbound(device: BluetoothDevice, value: ByteArray) {
+        val address = device.address
         val buf = rxBuffers.getOrPut(address) { ByteArrayOutputStream() }
         buf.write(value)
         val bytes = buf.toByteArray()
@@ -313,11 +314,30 @@ class BleTransportAdapter @Inject constructor(
         if (bytes.size > 2 + total) buf.write(bytes, 2 + total, bytes.size - (2 + total))
 
         val msg = DtnWireCodec.decode(wire, rssi = -60, snr = 10f) ?: return
-        // A successful decode means the peer is definitely reachable — strongest possible
-        // liveness signal, stronger than an advertisement. Refresh their last-seen so the
-        // sweeper doesn't misfire during an active exchange (which can drown out scan hits).
+        // A successful decode means the peer is definitely reachable — refresh the origin's
+        // last-seen so the sweeper doesn't misfire during an active exchange.
         peerLastSeenMs[msg.originNodeId.value] = System.currentTimeMillis()
-        _inboundMessages.tryEmit(InboundPacket(message = msg, channel = msg.channel))
+
+        // Identify the IMMEDIATE neighbour that wrote to us (the previous hop), NOT the wire
+        // header's origin (which for a relayed bundle is some far-away node).
+        //
+        // Handshake bundles (ROUTING_SUMMARY / ROUTING_ACK) are always sent by the directly
+        // connected peer, so their originNodeId IS that neighbour. We use that to LEARN the
+        // device-address → node-id mapping here — critical on radios (e.g. Qualcomm/OnePlus)
+        // that suspend active BLE scanning while a GATT link is up: on those phones we may
+        // never receive the peer's scan-response service data, so the scan path alone would
+        // leave the peer stuck "offline" even while we're actively exchanging data. Learning
+        // the mapping from the handshake, plus emitting an online encounter for any inbound
+        // write, guarantees the peer is recognised purely from received traffic.
+        val neighbour: NodeId? = if (msg.messageType.isHandshake) msg.originNodeId else nodeFor(address)
+        if (neighbour != null && neighbour != identity.nodeId) {
+            deviceForNode[neighbour.value] = device
+            // A live GATT write is a strong reachability signal; -60 dBm is a reasonable
+            // "connected neighbour" estimate that the scan path will refine if it ever fires.
+            emitOnlineEncounter(neighbour, rssi = -60)
+        }
+
+        _inboundMessages.tryEmit(InboundPacket(message = msg, channel = msg.channel, viaPeer = neighbour))
     }
 
     // ── Advertising ──────────────────────────────────────────────────────
@@ -372,6 +392,29 @@ class BleTransportAdapter @Inject constructor(
     /** Address → last time we emitted an encounter for this peer (debounce). */
     private val lastEncounterEmit = ConcurrentHashMap<String, Long>()
 
+    /**
+     * Mark a peer online from ANY liveness signal — a scan hit OR an inbound GATT write.
+     * [peerLastSeenMs] is always refreshed (it drives the staleness sweeper), but the
+     * [NodeEncounterEvent] is rate-limited to [ENCOUNTER_COOLDOWN_MS] per peer so we don't
+     * flood the orchestrator during an active transfer.
+     */
+    private fun emitOnlineEncounter(peer: NodeId, rssi: Int) {
+        if (peer == identity.nodeId) return
+        val now = System.currentTimeMillis()
+        peerLastSeenMs[peer.value] = now
+        val last = lastEncounterEmit[peer.value] ?: 0L
+        if (now - last < ENCOUNTER_COOLDOWN_MS) return
+        lastEncounterEmit[peer.value] = now
+        _nodeEvents.tryEmit(NodeEncounterEvent(
+            nodeId = peer,
+            rssi = rssi,
+            snr = 0f,
+            timestampMs = now,
+            isOnline = true,
+            shortName = "BLE",
+        ))
+    }
+
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val serviceData = result.scanRecord?.getServiceData(SERVICE_PARCEL) ?: return
@@ -380,27 +423,7 @@ class BleTransportAdapter @Inject constructor(
             if (peer == identity.nodeId) return // ignore our own advertisement
 
             deviceForNode[peer.value] = result.device
-
-            val now = System.currentTimeMillis()
-            // Always refresh liveness on any scan hit — the staleness sweeper reads this to
-            // decide when to declare a peer offline. Kept separate from the emit-rate debounce.
-            peerLastSeenMs[peer.value] = now
-
-            // Debounce: emit an encounter at most once per ENCOUNTER_COOLDOWN_MS per peer.
-            // BLE scan callbacks fire several times per second — without this we flood the
-            // orchestrator and thrash connections.
-            val last = lastEncounterEmit[peer.value] ?: 0L
-            if (now - last < ENCOUNTER_COOLDOWN_MS) return
-            lastEncounterEmit[peer.value] = now
-
-            _nodeEvents.tryEmit(NodeEncounterEvent(
-                nodeId = peer,
-                rssi = result.rssi,
-                snr = 0f,
-                timestampMs = now,
-                isOnline = true,
-                shortName = "BLE",
-            ))
+            emitOnlineEncounter(peer, result.rssi)
         }
 
         override fun onScanFailed(errorCode: Int) { Log.e(TAG, "Scan failed: $errorCode") }

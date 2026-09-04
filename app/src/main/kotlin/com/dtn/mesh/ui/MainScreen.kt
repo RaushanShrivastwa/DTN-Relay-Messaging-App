@@ -9,15 +9,21 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -648,78 +654,234 @@ private fun MessageComposer(onSend: (String) -> Unit) {
 @Composable
 private fun NetworkTab(viewModel: DtnViewModel) {
     val peers by viewModel.peerList.collectAsState()
+    val messages by viewModel.receivedMessages.collectAsState()
     val buffered by viewModel.bufferedMessages.collectAsState()
     val bufferedCount by viewModel.bufferedCount.collectAsState()
     val localNodeId by viewModel.localNodeId.collectAsState()
     val routes by viewModel.messageRoutes.collectAsState()
+    val activeStrategy by viewModel.activeStrategy.collectAsState()
     val pValues = viewModel.getProbabilities()
+    val onlinePeers = peers.count { it.isOnline }
+    val myId8 = localNodeId?.takeLast(8)
+    // A resolved route reached its destination. Split by whether WE were that destination
+    // (received) or we handed it onward to the final destination (delivered).
+    val resolvedRoutes = routes.count { it.delivered }
+    val receivedRoutes = routes.count { it.delivered && it.destination == myId8 }
+    val deliveredRoutes = resolvedRoutes - receivedRoutes
+    var selectedRoute by remember {
+        mutableStateOf<com.dtn.mesh.service.MessageLifecycleLog.RouteRecord?>(null)
+    }
 
-    LazyColumn(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
-        item { Spacer(Modifier.height(10.dp)) }
-        item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Column {
-                    SectionTitle("Peers")
-                    Text("Host ${localNodeId?.takeLast(8) ?: "—"}",
-                        fontSize = 11.sp, color = Palette.TextMuted,
-                        fontFamily = FontFamily.Monospace)
-                }
-                FilledTonalIconButton(
-                    onClick = { viewModel.refreshPeerStatus() },
-                    colors = IconButtonDefaults.filledTonalIconButtonColors(
-                        containerColor = Palette.Primary.copy(alpha = 0.10f),
-                        contentColor = Palette.Primary,
-                    ),
-                ) { Icon(Icons.Default.Refresh, contentDescription = "Refresh") }
-            }
-        }
-        if (peers.isEmpty()) {
-            item { EmptyState("No peers seen yet", "Connect to start discovery") }
-        } else {
-            items(peers, key = { it.nodeId }) { peer ->
-                NetworkPeerRow(peer, pValues[peer.nodeId])
-            }
-        }
-
-        item {
-            Spacer(Modifier.height(14.dp))
-            SectionTitle("Message routes")
-            Text("Each row is this node's view: source → previous hop → me → next hop",
-                fontSize = 11.sp, color = Palette.TextMuted, modifier = Modifier.padding(bottom = 4.dp))
-        }
-        if (routes.isEmpty()) {
-            item { EmptyState("No routes yet", "Send a message to start tracking") }
-        } else {
-            items(routes, key = { it.msgId }) { r -> RouteRow(r) }
-        }
-
-        item {
-            Spacer(Modifier.height(14.dp))
-            SectionTitle("Buffer ($bufferedCount)")
-        }
-        if (buffered.isEmpty()) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        LazyColumn(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
+            item { Spacer(Modifier.height(10.dp)) }
             item {
-                Card(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = Palette.Accent.copy(alpha = 0.12f)),
-                    shape = RoundedCornerShape(12.dp),
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(
-                        "✓ Buffer empty",
-                        modifier = Modifier.padding(12.dp),
-                        fontSize = 12.sp, color = Palette.Accent, fontWeight = FontWeight.SemiBold,
-                    )
+                    Column {
+                        Text("NETWORK OVERVIEW", fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                            color = Palette.Primary, letterSpacing = 1.sp)
+                        Text("This node · ${localNodeId?.takeLast(8) ?: "—"}", fontSize = 11.sp,
+                            color = Palette.TextMuted, fontFamily = FontFamily.Monospace)
+                    }
+                    FilledTonalIconButton(
+                        onClick = { viewModel.refreshPeerStatus() },
+                        colors = IconButtonDefaults.filledTonalIconButtonColors(
+                            containerColor = Palette.Primary.copy(alpha = 0.10f),
+                            contentColor = Palette.Primary,
+                        ),
+                    ) { Icon(Icons.Default.Refresh, contentDescription = "Refresh peer status") }
                 }
             }
-        } else {
-            items(buffered, key = { it.msgId }) { msg -> BufferRow(msg) }
+            item {
+                NetworkSummaryCard(
+                    onlinePeers = onlinePeers,
+                    totalPeers = peers.size,
+                    bufferedCount = bufferedCount,
+                    deliveredRoutes = deliveredRoutes,
+                    receivedRoutes = receivedRoutes,
+                )
+            }
+            item {
+                Spacer(Modifier.height(12.dp))
+                StrategySwitchRow(
+                    active = activeStrategy,
+                    onSelect = { viewModel.setStrategy(it) },
+                )
+            }
+            item {
+                Spacer(Modifier.height(14.dp))
+                AnalyticsSectionHeader("Peers", "${peers.size} known · $onlinePeers active")
+            }
+            if (peers.isEmpty()) {
+                item { EmptyState("No peers seen yet", "Connect to start discovery") }
+            } else {
+                items(peers, key = { it.nodeId }) { peer -> NetworkPeerRow(peer, pValues[peer.nodeId]) }
+            }
+
+            item {
+                Spacer(Modifier.height(14.dp))
+                AnalyticsSectionHeader("Local route observations", "$resolvedRoutes resolved · ${routes.size - resolvedRoutes} in transit")
+                Text("Observed at this phone — tap any route for message details.",
+                    fontSize = 11.sp, color = Palette.TextMuted, modifier = Modifier.padding(bottom = 4.dp))
+            }
+            if (routes.isEmpty()) {
+                item { EmptyState("No route observations yet", "Send a message to start tracking") }
+            } else {
+                // distinctBy guards the LazyColumn against duplicate keys even if the data
+                // layer ever emits two records with the same msgId (defence in depth).
+                items(routes.distinctBy { it.msgId }, key = { it.msgId }) { r ->
+                    RouteRow(r, peers, myId8) { selectedRoute = r }
+                }
+            }
+
+            item {
+                Spacer(Modifier.height(14.dp))
+                AnalyticsSectionHeader("Buffered messages", "$bufferedCount awaiting a delivery opportunity")
+            }
+            if (buffered.isEmpty()) {
+                item {
+                    Card(
+                        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                        colors = CardDefaults.cardColors(containerColor = Palette.Accent.copy(alpha = 0.12f)),
+                        shape = RoundedCornerShape(12.dp),
+                    ) {
+                        Text("✓ No messages are waiting to be forwarded", modifier = Modifier.padding(12.dp),
+                            fontSize = 12.sp, color = Palette.Accent, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            } else {
+                items(buffered, key = { it.msgId }) { msg -> BufferRow(msg) }
+            }
+            item { Spacer(Modifier.height(24.dp)) }
         }
-        item { Spacer(Modifier.height(24.dp)) }
+
+        selectedRoute?.let { route ->
+            val chat = messages.firstOrNull { it.msgId.take(8) == route.msgId }
+            // Resolve the full destination node id from the peer list (route stores only the
+            // last 8 chars) or from the matched chat message, then ask the ViewModel for the
+            // routing-math breakdown toward it.
+            val fullDest = peers.firstOrNull { it.nodeId.takeLast(8) == route.destination }?.nodeId
+                ?: chat?.toNodeId
+            val explanation = fullDest?.let { viewModel.explainRoute(it) }
+            RouteDetailDialog(
+                route = route,
+                chat = chat,
+                peers = peers,
+                myId8 = myId8,
+                explanation = explanation,
+                onDismiss = { selectedRoute = null },
+            )
+        }
+    }
+}
+
+@Composable
+private fun StrategySwitchRow(active: String, onSelect: (String) -> Unit) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        colors = CardDefaults.cardColors(containerColor = Palette.CardSurface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
+        shape = RoundedCornerShape(12.dp),
+    ) {
+        Column(modifier = Modifier.padding(10.dp)) {
+            Text("ROUTING PROTOCOL", fontSize = 9.sp, color = Palette.TextMuted, letterSpacing = 0.8.sp)
+            Spacer(Modifier.height(6.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                StrategyChip("PROPHET", "Probabilistic", active == "PROPHET") { onSelect("PROPHET") }
+                StrategyChip("MAXPROP", "Path-cost", active == "MAXPROP") { onSelect("MAXPROP") }
+            }
+        }
+    }
+}
+
+@Composable
+private fun RowScope.StrategyChip(name: String, subtitle: String, selected: Boolean, onClick: () -> Unit) {
+    val bg = if (selected) Palette.Primary else Palette.Surface
+    val fg = if (selected) Color.White else Palette.TextSecondary
+    Surface(
+        modifier = Modifier.weight(1f).clickable(onClick = onClick),
+        shape = RoundedCornerShape(10.dp),
+        color = bg,
+    ) {
+        Column(modifier = Modifier.padding(vertical = 8.dp, horizontal = 10.dp)) {
+            Text(name, fontSize = 12.sp, fontWeight = FontWeight.Bold, color = fg)
+            Text(subtitle, fontSize = 9.sp, color = if (selected) Color.White.copy(alpha = 0.8f) else Palette.TextMuted)
+        }
+    }
+}
+
+/** Tappable header that reveals/hides [content]. Local, transient expand state. */
+@Composable
+private fun ExpandableSection(
+    title: String,
+    subtitle: String? = null,
+    initiallyExpanded: Boolean = false,
+    content: @Composable () -> Unit,
+) {
+    var expanded by remember { mutableStateOf(initiallyExpanded) }
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier.fillMaxWidth().clickable { expanded = !expanded }.padding(vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, color = Palette.Primary)
+                if (subtitle != null) Text(subtitle, fontSize = 10.sp, color = Palette.TextMuted)
+            }
+            Text(if (expanded) "▾" else "▸", fontSize = 14.sp, color = Palette.Primary)
+        }
+        if (expanded) content()
+    }
+}
+
+@Composable
+private fun NetworkSummaryCard(
+    onlinePeers: Int,
+    totalPeers: Int,
+    bufferedCount: Int,
+    deliveredRoutes: Int,
+    receivedRoutes: Int,
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(top = 10.dp),
+        colors = CardDefaults.cardColors(containerColor = Palette.PrimaryDark),
+        shape = RoundedCornerShape(14.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(vertical = 14.dp, horizontal = 6.dp),
+            horizontalArrangement = Arrangement.SpaceEvenly,
+        ) {
+            SummaryMetric("ACTIVE", "$onlinePeers/$totalPeers", "peers", Color.White)
+            SummaryMetric("BUFFER", "$bufferedCount", "waiting", if (bufferedCount == 0) Color.White else Color(0xFFFFE082))
+            SummaryMetric("DELIVERED", "$deliveredRoutes", "relayed on", Color.White)
+            SummaryMetric("RECEIVED", "$receivedRoutes", "for me", Color.White)
+        }
+    }
+}
+
+@Composable
+private fun SummaryMetric(label: String, value: String, detail: String, color: Color) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Text(label, fontSize = 9.sp, color = Color.White.copy(alpha = 0.72f), letterSpacing = 0.8.sp)
+        Text(value, fontSize = 18.sp, fontWeight = FontWeight.Bold, color = color)
+        Text(detail, fontSize = 10.sp, color = Color.White.copy(alpha = 0.72f))
+    }
+}
+
+@Composable
+private fun AnalyticsSectionHeader(title: String, detail: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(top = 4.dp, bottom = 6.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(title.uppercase(), fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Palette.Primary,
+            letterSpacing = 1.sp)
+        Text(detail, fontSize = 10.sp, color = Palette.TextMuted, fontFamily = FontFamily.Monospace)
     }
 }
 
@@ -755,6 +917,11 @@ private fun NetworkPeerRow(peer: PeerInfo, p: Double?) {
                     fontSize = 11.sp, color = Palette.TextSecondary,
                     fontFamily = FontFamily.Monospace,
                 )
+                Text(
+                    if (peer.isOnline) "active now" else "last seen ${relativeSince(peer.lastSeenMs)}",
+                    fontSize = 10.sp,
+                    color = if (peer.isOnline) Palette.Accent else Palette.TextMuted,
+                )
             }
             Column(horizontalAlignment = Alignment.End) {
                 AssistChip(
@@ -779,72 +946,354 @@ private fun NetworkPeerRow(peer: PeerInfo, p: Double?) {
 }
 
 @Composable
-private fun RouteRow(r: com.dtn.mesh.service.MessageLifecycleLog.RouteRecord) {
+private fun RouteRow(
+    r: com.dtn.mesh.service.MessageLifecycleLog.RouteRecord,
+    peers: List<PeerInfo>,
+    myId8: String?,
+    onClick: () -> Unit,
+) {
     val statusColor = if (r.delivered) Palette.Accent else Palette.Warning
-    val statusText = if (r.delivered) "delivered" else "in transit"
+    val statusText = if (r.delivered) "RESOLVED" else "IN TRANSIT"
+    val fromLabel = peerLabelFor(r.source, peers, myId8)
+    val toLabel = peerLabelFor(r.destination, peers, myId8)
     Card(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp).clickable(onClick = onClick),
         colors = CardDefaults.cardColors(containerColor = Palette.CardSurface),
         elevation = CardDefaults.cardElevation(defaultElevation = 1.dp),
         shape = RoundedCornerShape(12.dp),
     ) {
-        Column(modifier = Modifier.padding(10.dp)) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("msg=${r.msgId}", fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold,
+        Row(modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
+            // Colored status rail — instant delivered/in-transit read.
+            Box(modifier = Modifier.width(4.dp).fillMaxHeight().background(statusColor))
+            Column(modifier = Modifier.weight(1f).padding(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("MSG ${r.msgId}", fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold, color = Palette.TextPrimary)
+                    Spacer(Modifier.weight(1f))
+                    Surface(shape = RoundedCornerShape(8.dp), color = statusColor.copy(alpha = 0.15f)) {
+                        Text(statusText, fontSize = 9.sp, color = statusColor,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp), fontWeight = FontWeight.Bold)
+                    }
+                }
+                Spacer(Modifier.height(6.dp))
+                // Highlight the human-readable endpoints first, node ids second.
+                Text(
+                    "${fromLabel ?: r.source}  →  ${toLabel ?: r.destination}",
+                    fontSize = 13.sp, color = Palette.TextPrimary, fontWeight = FontWeight.SemiBold,
+                )
+                Text("${r.source} → ${r.destination}", fontSize = 9.sp,
+                    color = Palette.TextMuted, fontFamily = FontFamily.Monospace)
+                Text("OBSERVED PATH", fontSize = 8.sp, color = Palette.TextMuted,
+                    letterSpacing = 0.6.sp, modifier = Modifier.padding(top = 6.dp))
+                Text(pathWithYou(r.asPath(), myId8), fontSize = 12.sp, color = Palette.Primary,
+                    fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Medium)
+                Text("Tap for details", fontSize = 9.sp, color = Palette.Primary.copy(alpha = 0.7f),
+                    modifier = Modifier.padding(top = 4.dp))
+            }
+        }
+    }
+}
+
+/**
+ * Map a truncated (last-8) node id — as stored on route/lifecycle records — back to a
+ * peer's saved nickname / long name for display. Returns null when there's no match so
+ * callers can fall back to the raw id.
+ */
+private fun peerLabelFor(idSuffix: String?, peers: List<PeerInfo>, myId8: String? = null): String? {
+    if (idSuffix.isNullOrBlank()) return null
+    if (idSuffix == "BROADCAST") return "Broadcast"
+    if (myId8 != null && idSuffix == myId8) return "YOU"
+    val match = peers.firstOrNull { it.nodeId.takeLast(8) == idSuffix } ?: return null
+    val label = match.displayName()
+    // displayName() falls back to the last-8 id; if that's all we have it isn't a real
+    // nickname, so treat it as "no friendly name".
+    return if (label == idSuffix) null else label
+}
+
+/** Replace the local node's id in an observed-path string with "YOU" for readability. */
+private fun pathWithYou(path: String, myId8: String?): String =
+    if (myId8.isNullOrBlank()) path else path.replace(myId8, "YOU")
+
+/** Compact relative "time since" label for a last-seen timestamp. */
+private fun relativeSince(ms: Long): String {
+    if (ms <= 0L) return "never"
+    val delta = System.currentTimeMillis() - ms
+    return when {
+        delta < 10_000L -> "just now"
+        delta < 60_000L -> "${delta / 1000}s ago"
+        delta < 3_600_000L -> "${delta / 60_000}m ago"
+        delta < 86_400_000L -> "${delta / 3_600_000}h ago"
+        else -> "${delta / 86_400_000}d ago"
+    }
+}
+
+@Composable
+private fun RouteDetailDialog(
+    route: com.dtn.mesh.service.MessageLifecycleLog.RouteRecord,
+    chat: ChatMessage?,
+    peers: List<PeerInfo>,
+    myId8: String?,
+    explanation: RoutingExplanation?,
+    onDismiss: () -> Unit,
+) {
+    val fromLabel = peerLabelFor(route.source, peers, myId8)
+    val toLabel = peerLabelFor(route.destination, peers, myId8)
+    val prevLabel = peerLabelFor(route.prevHop, peers, myId8)
+    val nextLabel = peerLabelFor(route.nextHop, peers, myId8)
+    val time = java.text.SimpleDateFormat("MMM d, HH:mm:ss", java.util.Locale.US)
+        .format(java.util.Date(route.timestampMs))
+    val statusColor = if (route.delivered) Palette.Accent else Palette.Warning
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = { TextButton(onClick = onDismiss) { Text("Close") } },
+        title = {
+            Column {
+                Text("Message details", fontWeight = FontWeight.SemiBold, fontSize = 16.sp,
                     color = Palette.TextPrimary)
-                Spacer(Modifier.width(6.dp))
-                Text("${r.source} → ${r.destination}", fontSize = 11.sp,
-                    color = Palette.TextSecondary, fontFamily = FontFamily.Monospace)
-                Spacer(Modifier.weight(1f))
-                Surface(shape = RoundedCornerShape(8.dp),
-                    color = statusColor.copy(alpha = 0.15f)) {
-                    Text(statusText, fontSize = 9.sp, color = statusColor,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                        fontWeight = FontWeight.Bold)
+                Text("MSG ${route.msgId}", fontSize = 11.sp, color = Palette.TextMuted,
+                    fontFamily = FontFamily.Monospace)
+            }
+        },
+        text = {
+            Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                Surface(shape = RoundedCornerShape(8.dp), color = statusColor.copy(alpha = 0.15f)) {
+                    Text(if (route.delivered) "DELIVERED" else "IN TRANSIT",
+                        fontSize = 10.sp, color = statusColor, fontWeight = FontWeight.Bold,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp))
+                }
+                Spacer(Modifier.height(10.dp))
+
+                DetailRow("Content", chat?.text ?: "Not available on this device")
+                DetailRow("From", labelWithId(fromLabel, route.source))
+                DetailRow("To", labelWithId(toLabel, route.destination))
+                if (!route.prevHop.isNullOrBlank())
+                    DetailRow("Received from (prev hop)", labelWithId(prevLabel, route.prevHop))
+                DetailRow("This node", if (route.me == myId8) "YOU (${route.me})" else route.me)
+                if (!route.nextHop.isNullOrBlank())
+                    DetailRow("Forwarded to (next hop)", labelWithId(nextLabel, route.nextHop))
+                DetailRow("Observed path", pathWithYou(route.asPath(), myId8), mono = true)
+                if (route.strategy.isNotBlank()) DetailRow("Routed by", route.strategy)
+                DetailRow("Last update", time)
+                if (chat != null) {
+                    DetailRow("Direction", if (chat.isOutgoing) "Outgoing" else "Incoming")
+                    DetailRow("Chat status", chat.status)
+                }
+
+                if (explanation != null) {
+                    HorizontalDivider(color = Palette.Divider, modifier = Modifier.padding(vertical = 6.dp))
+                    RoutingMathSection(route, explanation)
                 }
             }
-            Spacer(Modifier.height(4.dp))
-            Text(
-                r.asPath(),
-                fontSize = 12.sp, color = Palette.Primary, fontFamily = FontFamily.Monospace,
-                fontWeight = FontWeight.Medium,
-            )
+        },
+    )
+}
+
+/**
+ * Expandable probability-math breakdown for how the active strategy scores routes toward the
+ * message's destination. Shows my own belief, each candidate carrier's belief, the 2-hop path
+ * likelihood, and the transitive gain — annotating the previous/next hop on this route.
+ */
+@Composable
+private fun RoutingMathSection(
+    route: com.dtn.mesh.service.MessageLifecycleLog.RouteRecord,
+    exp: RoutingExplanation,
+) {
+    ExpandableSection(
+        title = "Routing math · ${exp.strategy}",
+        subtitle = "How the path toward ${route.destination} is scored — tap to expand",
+    ) {
+        Column(modifier = Modifier.padding(top = 8.dp)) {
+            // ── Headline scores in two highlighted stat tiles ──
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                StatTile(
+                    modifier = Modifier.weight(1f),
+                    label = exp.myScoreLabel.uppercase(),
+                    value = "%.3f".format(exp.myScore),
+                    tint = Palette.Primary,
+                )
+                StatTile(
+                    modifier = Modifier.weight(1f),
+                    label = "BEST NEXT HOP",
+                    value = exp.bestNextHop?.let { exp.bestNextHopName ?: it.takeLast(8) } ?: "none",
+                    subValue = exp.bestNextHop?.let { "${exp.bestScoreLabel} ${"%.3f".format(exp.bestScore)}" },
+                    tint = if (exp.bestNextHop != null) Palette.Accent else Palette.TextMuted,
+                )
+            }
+
+            Spacer(Modifier.height(14.dp))
+            Text("CANDIDATE CARRIERS", fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                color = Palette.TextSecondary, letterSpacing = 0.8.sp)
+            Spacer(Modifier.height(6.dp))
+            if (exp.beliefs.isEmpty()) {
+                Text("No candidate carriers known yet.", fontSize = 12.sp, color = Palette.TextMuted,
+                    modifier = Modifier.padding(vertical = 6.dp))
+            } else {
+                exp.beliefs.take(8).forEachIndexed { i, b ->
+                    val role = when (b.nodeId.takeLast(8)) {
+                        route.prevHop -> "prev hop"
+                        route.nextHop -> "next hop"
+                        else -> null
+                    }
+                    CarrierBeliefRow(b, role, exp.bestScoreLabel, isBest = i == 0 && b.score > 0.0)
+                }
+            }
+
+            Spacer(Modifier.height(14.dp))
+            ExpandableSection(title = "Formulas & constants") {
+                Column(modifier = Modifier.padding(top = 8.dp)) {
+                    exp.formulas.forEach { FormulaLine(it.label, it.formula) }
+                    Spacer(Modifier.height(8.dp))
+                    Surface(shape = RoundedCornerShape(8.dp), color = Palette.Surface,
+                        modifier = Modifier.fillMaxWidth()) {
+                        Text(exp.constantsLine, fontSize = 11.sp, color = Palette.TextSecondary,
+                            fontFamily = FontFamily.Monospace,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp))
+                    }
+                }
+            }
         }
     }
 }
 
 @Composable
+private fun StatTile(
+    modifier: Modifier = Modifier,
+    label: String,
+    value: String,
+    subValue: String? = null,
+    tint: Color,
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(10.dp),
+        color = tint.copy(alpha = 0.10f),
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 10.dp)) {
+            Text(label, fontSize = 9.sp, color = Palette.TextMuted, letterSpacing = 0.6.sp)
+            Spacer(Modifier.height(4.dp))
+            Text(value, fontSize = 15.sp, fontWeight = FontWeight.Bold, color = tint, maxLines = 1)
+            if (subValue != null) {
+                Text(subValue, fontSize = 10.sp, color = Palette.TextSecondary,
+                    fontFamily = FontFamily.Monospace)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CarrierBeliefRow(
+    b: RoutingNodeBelief,
+    role: String?,
+    scoreLabel: String,
+    isBest: Boolean,
+) {
+    val dot = if (b.isOnline) Palette.Accent else Palette.Error
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        shape = RoundedCornerShape(10.dp),
+        color = if (isBest) Palette.Accent.copy(alpha = 0.08f) else Palette.Surface,
+    ) {
+        Column(modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(modifier = Modifier.size(8.dp).clip(CircleShape).background(dot))
+                Spacer(Modifier.width(8.dp))
+                Text(b.displayName, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+                    color = Palette.TextPrimary)
+                if (role != null) {
+                    Spacer(Modifier.width(6.dp))
+                    Surface(shape = RoundedCornerShape(6.dp), color = Palette.Primary.copy(alpha = 0.12f)) {
+                        Text(role, fontSize = 8.sp, color = Palette.Primary, fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 5.dp, vertical = 2.dp))
+                    }
+                }
+                Spacer(Modifier.weight(1f))
+                Text("$scoreLabel ${"%.3f".format(b.score)}", fontSize = 12.sp, color = Palette.Primary,
+                    fontFamily = FontFamily.Monospace, fontWeight = FontWeight.Bold)
+            }
+            Spacer(Modifier.height(4.dp))
+            Text(b.detail, fontSize = 10.sp, color = Palette.TextMuted, fontFamily = FontFamily.Monospace)
+        }
+    }
+}
+
+@Composable
+private fun FormulaLine(label: String, formula: String) {
+    Column(modifier = Modifier.padding(bottom = 8.dp)) {
+        Text(label, fontSize = 10.sp, color = Palette.TextSecondary, fontWeight = FontWeight.Medium)
+        Spacer(Modifier.height(2.dp))
+        Text(formula, fontSize = 12.sp, color = Palette.TextPrimary, fontFamily = FontFamily.Monospace)
+    }
+}
+
+/** Prefer the friendly label, then append the raw id in parentheses for traceability. */
+private fun labelWithId(label: String?, id: String?): String = when {
+    id.isNullOrBlank() -> "—"
+    label == null -> id
+    else -> "$label ($id)"
+}
+
+@Composable
+private fun DetailRow(label: String, value: String, mono: Boolean = false) {
+    Column(modifier = Modifier.padding(bottom = 8.dp)) {
+        Text(label.uppercase(), fontSize = 9.sp, color = Palette.TextMuted, letterSpacing = 0.6.sp)
+        Text(
+            value,
+            fontSize = 13.sp,
+            color = Palette.TextPrimary,
+            fontFamily = if (mono) FontFamily.Monospace else FontFamily.Default,
+        )
+    }
+}
+
+@Composable
 private fun BufferRow(msg: BufferedMsgInfo) {
+    val urgencyColor = when {
+        msg.ttlMin <= 5L -> Palette.Error
+        msg.ttlMin <= 30L -> Palette.Warning
+        else -> Palette.Primary
+    }
+    val urgencyText = when {
+        msg.ttlMin <= 5L -> "EXPIRING SOON"
+        msg.ttlMin <= 30L -> "TIME SENSITIVE"
+        else -> "QUEUED"
+    }
     Card(
         modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
-        colors = CardDefaults.cardColors(
-            containerColor = Palette.Warning.copy(alpha = 0.06f)),
+        colors = CardDefaults.cardColors(containerColor = urgencyColor.copy(alpha = 0.06f)),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
         shape = RoundedCornerShape(12.dp),
     ) {
         Column(modifier = Modifier.padding(10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("msg=${msg.msgId}", fontSize = 11.sp,
-                    fontFamily = FontFamily.Monospace, fontWeight = FontWeight.SemiBold,
-                    color = Palette.TextPrimary)
-                Spacer(Modifier.width(6.dp))
-                Text("${msg.origin} → ${msg.dest}", fontSize = 11.sp,
-                    color = Palette.TextSecondary, fontFamily = FontFamily.Monospace)
+                Text("MSG ${msg.msgId}", fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                    fontWeight = FontWeight.Bold, color = Palette.TextPrimary)
                 Spacer(Modifier.weight(1f))
-                Surface(shape = RoundedCornerShape(8.dp),
-                    color = Palette.Warning.copy(alpha = 0.2f)) {
-                    Text(msg.status, fontSize = 9.sp, color = Palette.Warning,
-                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                        fontWeight = FontWeight.Bold)
+                Surface(shape = RoundedCornerShape(8.dp), color = urgencyColor.copy(alpha = 0.16f)) {
+                    Text(urgencyText, fontSize = 9.sp, color = urgencyColor,
+                        modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp), fontWeight = FontWeight.Bold)
                 }
             }
-            Spacer(Modifier.height(2.dp))
-            Text(
-                "hop=${msg.hopCount} · fwd=${msg.forwardCount} · ttl=${msg.ttlMin}m · age=${msg.bufferedFor}s",
-                fontSize = 10.sp, color = Palette.TextMuted, fontFamily = FontFamily.Monospace,
-            )
+            Spacer(Modifier.height(4.dp))
+            Text("${msg.origin}  →  ${msg.dest}", fontSize = 10.sp, color = Palette.TextSecondary,
+                fontFamily = FontFamily.Monospace)
+            Spacer(Modifier.height(6.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                BufferMetric("TTL", "${msg.ttlMin}m", urgencyColor)
+                BufferMetric("AGE", "${msg.bufferedFor}s", Palette.TextSecondary)
+                BufferMetric("HOPS", "${msg.hopCount}", Palette.TextSecondary)
+                BufferMetric("FORWARDS", "${msg.forwardCount}", Palette.TextSecondary)
+            }
         }
+    }
+}
+
+@Composable
+private fun BufferMetric(label: String, value: String, color: Color) {
+    Column {
+        Text(label, fontSize = 8.sp, color = Palette.TextMuted, letterSpacing = 0.5.sp)
+        Text(value, fontSize = 11.sp, color = color, fontFamily = FontFamily.Monospace,
+            fontWeight = FontWeight.SemiBold)
     }
 }
 
@@ -858,21 +1307,192 @@ private fun estimateDistStr(rssi: Int): String {
  *  Lifecycle tab — color-coded state feed
  * ========================================================================== */
 
+private enum class LifecycleFilter(val label: String) {
+    ALL("All"), FLOW("Flow"), DELIVERY("Delivery"), ACK("ACK"), ISSUES("Issues"),
+}
+
+@Composable
+private fun LifecycleFilterChip(
+    option: LifecycleFilter,
+    selectedFilter: LifecycleFilter,
+    onClick: () -> Unit,
+) {
+    val selected = selectedFilter == option
+    AssistChip(
+        onClick = onClick,
+        label = { Text(option.label, fontSize = 10.sp) },
+        colors = AssistChipDefaults.assistChipColors(
+            containerColor = if (selected) Palette.Primary.copy(alpha = 0.14f) else Palette.CardSurface,
+            labelColor = if (selected) Palette.Primary else Palette.TextSecondary,
+        ),
+    )
+}
+
 @Composable
 private fun LifecycleTab(viewModel: DtnViewModel) {
     val entries by viewModel.lifecycleEntries.collectAsState()
-    Column(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
-        Spacer(Modifier.height(10.dp))
-        SectionTitle("Message lifecycle")
-        Text("Real-time state transitions for every message",
-            fontSize = 11.sp, color = Palette.TextMuted,
-            modifier = Modifier.padding(bottom = 8.dp))
-        if (entries.isEmpty()) {
-            EmptyState("No events yet", "Send a message to see lifecycle tracking")
+    var filter by remember { mutableStateOf(LifecycleFilter.ALL) }
+    val visibleEntries = entries.filter { entry ->
+        when (filter) {
+            LifecycleFilter.ALL -> true
+            LifecycleFilter.FLOW -> entry.event in setOf(
+                com.dtn.mesh.service.LifecycleEvent.CREATED,
+                com.dtn.mesh.service.LifecycleEvent.BUFFERED,
+                com.dtn.mesh.service.LifecycleEvent.FORWARDED,
+                com.dtn.mesh.service.LifecycleEvent.BUFFER_CLEARED,
+            )
+            LifecycleFilter.DELIVERY -> entry.event == com.dtn.mesh.service.LifecycleEvent.DELIVERED
+            LifecycleFilter.ACK -> entry.event in setOf(
+                com.dtn.mesh.service.LifecycleEvent.ACK_GENERATED,
+                com.dtn.mesh.service.LifecycleEvent.ACK_RECEIVED,
+            )
+            LifecycleFilter.ISSUES -> entry.event in setOf(
+                com.dtn.mesh.service.LifecycleEvent.DUPLICATE,
+                com.dtn.mesh.service.LifecycleEvent.IGNORED,
+                com.dtn.mesh.service.LifecycleEvent.EXPIRED,
+                com.dtn.mesh.service.LifecycleEvent.HOP_LIMIT,
+                com.dtn.mesh.service.LifecycleEvent.DROPPED,
+            )
+        }
+    }
+    val bufferHistory = deriveBufferHistory(entries)
+
+    LazyColumn(modifier = Modifier.fillMaxSize().padding(horizontal = 12.dp)) {
+        // ── Buffer history: store-and-forward outcomes ──
+        item {
+            Spacer(Modifier.height(10.dp))
+            AnalyticsSectionHeader("Buffer history", "${bufferHistory.size} store-and-forward records")
+            Text("Messages that entered the buffer and how each one left it.",
+                fontSize = 11.sp, color = Palette.TextMuted, modifier = Modifier.padding(bottom = 6.dp))
+        }
+        if (bufferHistory.isEmpty()) {
+            item { EmptyState("No buffered messages yet", "Carried messages will be tracked here") }
         } else {
-            LazyColumn(modifier = Modifier.fillMaxSize()) {
-                items(entries.size) { index -> LifecycleEntryRow(entries[index]) }
-                item { Spacer(Modifier.height(24.dp)) }
+            items(bufferHistory, key = { "buf-${it.msgId}" }) { BufferHistoryRow(it) }
+        }
+
+        // ── Live event log with filters ──
+        item {
+            Spacer(Modifier.height(16.dp))
+            AnalyticsSectionHeader("Event log", "${entries.size} recent events")
+            Text("Filter the live event stream to follow progress or investigate exceptions.",
+                fontSize = 11.sp, color = Palette.TextMuted, modifier = Modifier.padding(bottom = 6.dp))
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    LifecycleFilter.values().take(3).forEach { option -> LifecycleFilterChip(option, filter) { filter = option } }
+                }
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    LifecycleFilter.values().drop(3).forEach { option -> LifecycleFilterChip(option, filter) { filter = option } }
+                }
+            }
+            Spacer(Modifier.height(6.dp))
+        }
+        if (visibleEntries.isEmpty()) {
+            item {
+                EmptyState(if (entries.isEmpty()) "No events yet" else "No matching events",
+                    "Send a message to see lifecycle tracking")
+            }
+        } else {
+            // Index in the key guarantees uniqueness even if two events share the same
+            // timestamp/msg/event triple, which the string-only key could otherwise collide on.
+            itemsIndexed(
+                visibleEntries,
+                key = { i, e -> "$i-${e.timestamp}-${e.msgId}-${e.event}" },
+            ) { _, e -> LifecycleEntryRow(e) }
+        }
+        item { Spacer(Modifier.height(24.dp)) }
+    }
+}
+
+/** One message's journey through the buffer, reconstructed from the lifecycle event feed. */
+private data class BufferHistoryItem(
+    val msgId: String,
+    val origin: String,
+    val dest: String,
+    val bufferedAt: String,
+    val clearedAt: String?,
+    val clearEvent: com.dtn.mesh.service.LifecycleEvent?,
+    val note: String,
+)
+
+/**
+ * Reconstruct per-message buffer history from the (newest-first) lifecycle feed. A message
+ * qualifies once it has a BUFFERED event; its disposition is the most recent terminal event
+ * that removes it from the buffer. FORWARDED is intentionally NOT terminal — relaying to a
+ * mule does not clear our buffer, only a receipt / direct delivery / expiry does.
+ */
+private fun deriveBufferHistory(
+    entries: List<com.dtn.mesh.service.LifecycleEntry>,
+): List<BufferHistoryItem> {
+    val clearing = setOf(
+        com.dtn.mesh.service.LifecycleEvent.DELIVERED,
+        com.dtn.mesh.service.LifecycleEvent.BUFFER_CLEARED,
+        com.dtn.mesh.service.LifecycleEvent.EXPIRED,
+        com.dtn.mesh.service.LifecycleEvent.HOP_LIMIT,
+        com.dtn.mesh.service.LifecycleEvent.DROPPED,
+    )
+    val byId = LinkedHashMap<String, MutableList<com.dtn.mesh.service.LifecycleEntry>>()
+    for (e in entries) byId.getOrPut(e.msgId) { mutableListOf() }.add(e)
+    val out = mutableListOf<BufferHistoryItem>()
+    for ((id, list) in byId) {
+        // list is newest-first: lastOrNull match = earliest BUFFERED, firstOrNull = latest clear.
+        val buffered = list.lastOrNull { it.event == com.dtn.mesh.service.LifecycleEvent.BUFFERED } ?: continue
+        val cleared = list.firstOrNull { it.event in clearing }
+        out.add(BufferHistoryItem(
+            msgId = id,
+            origin = buffered.origin,
+            dest = buffered.dest,
+            bufferedAt = buffered.timestamp,
+            clearedAt = cleared?.timestamp,
+            clearEvent = cleared?.event,
+            note = cleared?.extra.orEmpty(),
+        ))
+    }
+    return out
+}
+
+@Composable
+private fun BufferHistoryRow(item: BufferHistoryItem) {
+    val (accent, disposition) = when (item.clearEvent) {
+        com.dtn.mesh.service.LifecycleEvent.DELIVERED -> Palette.Accent to "Delivered to destination"
+        com.dtn.mesh.service.LifecycleEvent.BUFFER_CLEARED -> Palette.Accent to "Cleared by delivery receipt"
+        com.dtn.mesh.service.LifecycleEvent.EXPIRED -> Palette.Error to "Expired before delivery"
+        com.dtn.mesh.service.LifecycleEvent.HOP_LIMIT -> Palette.Error to "Dropped — hop limit"
+        com.dtn.mesh.service.LifecycleEvent.DROPPED -> Palette.Error to "Dropped — low reachability"
+        else -> Palette.Warning to "Still buffered"
+    }
+    Card(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 3.dp),
+        colors = CardDefaults.cardColors(containerColor = Palette.CardSurface),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.5.dp),
+        shape = RoundedCornerShape(12.dp),
+    ) {
+        Row(modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
+            Box(modifier = Modifier.width(4.dp).fillMaxHeight().background(accent))
+            Column(modifier = Modifier.weight(1f).padding(10.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("MSG ${item.msgId}", fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Bold, color = Palette.TextPrimary)
+                    Spacer(Modifier.weight(1f))
+                    Surface(shape = RoundedCornerShape(8.dp), color = accent.copy(alpha = 0.15f)) {
+                        Text(disposition, fontSize = 9.sp, color = accent, fontWeight = FontWeight.Bold,
+                            modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp))
+                    }
+                }
+                if (item.origin.isNotEmpty() || item.dest.isNotEmpty()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text("${item.origin.ifEmpty { "—" }}  →  ${item.dest.ifEmpty { "—" }}",
+                        fontSize = 10.sp, color = Palette.TextSecondary, fontFamily = FontFamily.Monospace)
+                }
+                Spacer(Modifier.height(6.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                    BufferMetric("BUFFERED", item.bufferedAt, Palette.TextSecondary)
+                    BufferMetric("CLEARED", item.clearedAt ?: "—", accent)
+                }
+                if (item.note.isNotEmpty()) {
+                    Spacer(Modifier.height(4.dp))
+                    Text(item.note, fontSize = 10.sp, color = Palette.TextMuted, fontFamily = FontFamily.Monospace)
+                }
             }
         }
     }
@@ -880,59 +1500,91 @@ private fun LifecycleTab(viewModel: DtnViewModel) {
 
 @Composable
 private fun LifecycleEntryRow(entry: com.dtn.mesh.service.LifecycleEntry) {
-    val eventColor = when (entry.event) {
-        com.dtn.mesh.service.LifecycleEvent.CREATED -> Palette.Primary
-        com.dtn.mesh.service.LifecycleEvent.BUFFERED -> Palette.Warning
-        com.dtn.mesh.service.LifecycleEvent.FORWARDED -> Palette.Accent
-        com.dtn.mesh.service.LifecycleEvent.DELIVERED -> Palette.Accent
-        com.dtn.mesh.service.LifecycleEvent.ACK_GENERATED -> Palette.Broadcast
-        com.dtn.mesh.service.LifecycleEvent.ACK_RECEIVED -> Palette.Broadcast
-        com.dtn.mesh.service.LifecycleEvent.BUFFER_CLEARED -> Palette.Accent
-        com.dtn.mesh.service.LifecycleEvent.DUPLICATE -> Palette.Warning
-        com.dtn.mesh.service.LifecycleEvent.IGNORED -> Palette.TextMuted
-        com.dtn.mesh.service.LifecycleEvent.EXPIRED -> Palette.Error
-        com.dtn.mesh.service.LifecycleEvent.HOP_LIMIT -> Palette.Error
-    }
+    val eventColor = lifecycleColor(entry.event)
+    var expanded by remember(entry) { mutableStateOf(false) }
     Card(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp).clickable { expanded = !expanded },
         colors = CardDefaults.cardColors(containerColor = Palette.CardSurface),
         elevation = CardDefaults.cardElevation(defaultElevation = 0.5.dp),
         shape = RoundedCornerShape(10.dp),
     ) {
-        Row(
-            modifier = Modifier.padding(10.dp).fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Box(
-                modifier = Modifier.width(4.dp).height(38.dp).background(eventColor),
-            )
-            Spacer(Modifier.width(8.dp))
-            Column(modifier = Modifier.weight(1f)) {
+        Row(modifier = Modifier.fillMaxWidth().height(IntrinsicSize.Min)) {
+            Box(modifier = Modifier.width(4.dp).fillMaxHeight().background(eventColor))
+            Column(modifier = Modifier.weight(1f).padding(10.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text(entry.event.name, fontSize = 11.sp, fontWeight = FontWeight.Bold,
-                        color = eventColor, fontFamily = FontFamily.Monospace)
-                    Spacer(Modifier.width(6.dp))
+                    Text(lifecycleLabel(entry.event), fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                        color = eventColor)
+                    Spacer(Modifier.weight(1f))
                     Text(entry.timestamp, fontSize = 10.sp, color = Palette.TextMuted,
                         fontFamily = FontFamily.Monospace)
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (expanded) "▾" else "▸", fontSize = 12.sp, color = Palette.TextMuted)
                 }
-                Text(
-                    buildString {
-                        append("msg=${entry.msgId}")
-                        if (entry.origin.isNotEmpty()) append(" · from=${entry.origin}")
-                        if (entry.dest.isNotEmpty()) append(" · to=${entry.dest}")
-                        if (entry.hopCount >= 0) append(" · hop=${entry.hopCount}")
-                        if (entry.ttlRemainingMin >= 0) append(" · ttl=${entry.ttlRemainingMin}m")
-                    },
-                    fontSize = 10.sp, fontFamily = FontFamily.Monospace,
-                    color = Palette.TextSecondary,
-                )
-                if (entry.extra.isNotEmpty()) {
-                    Text(entry.extra, fontSize = 10.sp, color = Palette.TextMuted,
-                        fontFamily = FontFamily.Monospace)
+                Text(buildString {
+                    append("MSG ${entry.msgId}")
+                    if (entry.origin.isNotEmpty()) append(" · FROM ${entry.origin}")
+                    if (entry.dest.isNotEmpty()) append(" · TO ${entry.dest}")
+                }, fontSize = 10.sp, fontFamily = FontFamily.Monospace, color = Palette.TextSecondary)
+
+                if (!expanded) {
+                    // Collapsed: compact one-liner of the key metrics.
+                    val metrics = buildString {
+                        if (entry.hopCount >= 0) append("Hops ${entry.hopCount}")
+                        if (entry.forwardCount >= 0) append(if (isNotEmpty()) " · " else "").append("Fwd ${entry.forwardCount}")
+                        if (entry.ttlRemainingMin >= 0) append(if (isNotEmpty()) " · " else "").append("TTL ${entry.ttlRemainingMin}m")
+                    }
+                    if (metrics.isNotEmpty()) Text(metrics, fontSize = 10.sp, color = Palette.TextMuted,
+                        fontFamily = FontFamily.Monospace, maxLines = 1)
+                } else {
+                    // Expanded: full labeled breakdown of every populated field.
+                    Spacer(Modifier.height(6.dp))
+                    LifecycleDetail("Event", lifecycleLabel(entry.event))
+                    LifecycleDetail("Time", entry.timestamp)
+                    LifecycleDetail("Message", entry.msgId)
+                    if (entry.origin.isNotEmpty()) LifecycleDetail("From", entry.origin)
+                    if (entry.dest.isNotEmpty()) LifecycleDetail("To", entry.dest)
+                    if (entry.hopCount >= 0) LifecycleDetail("Hop count", entry.hopCount.toString())
+                    if (entry.forwardCount >= 0) LifecycleDetail("Forward count", entry.forwardCount.toString())
+                    if (entry.ttlRemainingMin >= 0) LifecycleDetail("TTL remaining", "${entry.ttlRemainingMin} min")
+                    if (entry.extra.isNotEmpty()) LifecycleDetail("Detail", entry.extra)
                 }
             }
         }
     }
+}
+
+@Composable
+private fun LifecycleDetail(label: String, value: String) {
+    Row(modifier = Modifier.fillMaxWidth().padding(vertical = 1.dp)) {
+        Text(label, fontSize = 10.sp, color = Palette.TextMuted, modifier = Modifier.width(96.dp))
+        Text(value, fontSize = 10.sp, color = Palette.TextSecondary, fontFamily = FontFamily.Monospace)
+    }
+}
+
+private fun lifecycleColor(event: com.dtn.mesh.service.LifecycleEvent): Color = when (event) {
+    com.dtn.mesh.service.LifecycleEvent.CREATED -> Palette.Primary
+    com.dtn.mesh.service.LifecycleEvent.BUFFERED, com.dtn.mesh.service.LifecycleEvent.DUPLICATE -> Palette.Warning
+    com.dtn.mesh.service.LifecycleEvent.FORWARDED, com.dtn.mesh.service.LifecycleEvent.DELIVERED,
+    com.dtn.mesh.service.LifecycleEvent.BUFFER_CLEARED -> Palette.Accent
+    com.dtn.mesh.service.LifecycleEvent.ACK_GENERATED, com.dtn.mesh.service.LifecycleEvent.ACK_RECEIVED -> Palette.Broadcast
+    com.dtn.mesh.service.LifecycleEvent.IGNORED -> Palette.TextMuted
+    com.dtn.mesh.service.LifecycleEvent.EXPIRED, com.dtn.mesh.service.LifecycleEvent.HOP_LIMIT,
+    com.dtn.mesh.service.LifecycleEvent.DROPPED -> Palette.Error
+}
+
+private fun lifecycleLabel(event: com.dtn.mesh.service.LifecycleEvent): String = when (event) {
+    com.dtn.mesh.service.LifecycleEvent.CREATED -> "Created"
+    com.dtn.mesh.service.LifecycleEvent.BUFFERED -> "Buffered"
+    com.dtn.mesh.service.LifecycleEvent.DUPLICATE -> "Duplicate received"
+    com.dtn.mesh.service.LifecycleEvent.FORWARDED -> "Forwarded"
+    com.dtn.mesh.service.LifecycleEvent.IGNORED -> "Ignored"
+    com.dtn.mesh.service.LifecycleEvent.ACK_GENERATED -> "Acknowledgement generated"
+    com.dtn.mesh.service.LifecycleEvent.ACK_RECEIVED -> "Acknowledgement received"
+    com.dtn.mesh.service.LifecycleEvent.BUFFER_CLEARED -> "Buffer cleared"
+    com.dtn.mesh.service.LifecycleEvent.DELIVERED -> "Delivered"
+    com.dtn.mesh.service.LifecycleEvent.EXPIRED -> "Expired"
+    com.dtn.mesh.service.LifecycleEvent.HOP_LIMIT -> "Hop limit reached"
+    com.dtn.mesh.service.LifecycleEvent.DROPPED -> "Dropped (housekeeping)"
 }
 
 /* ==========================================================================

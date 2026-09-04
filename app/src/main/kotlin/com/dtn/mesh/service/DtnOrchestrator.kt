@@ -97,6 +97,15 @@ class DtnOrchestrator @Inject constructor(
      */
     private val sentTo = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentHashMap<String, Long>>()
 
+    /**
+     * msgId → the immediate peer we received that bundle from (the real previous hop, as
+     * reported by the transport). Used to suppress the reverse-echo bug: in an A→B→C→D
+     * chain, C must not hand the bundle straight back to B just because B isn't the wire
+     * header's origin (A). Entries are cleared alongside [sentTo] when the message leaves
+     * our buffer.
+     */
+    private val receivedFrom = java.util.concurrent.ConcurrentHashMap<String, String>()
+
     private fun markSentTo(msgId: String, peer: String) {
         sentTo.getOrPut(msgId) { java.util.concurrent.ConcurrentHashMap() }[peer] = System.currentTimeMillis()
     }
@@ -110,6 +119,7 @@ class DtnOrchestrator @Inject constructor(
     /** Drop tracking for a message that is no longer in our buffer (delivered / expired). */
     private fun forgetSentTo(msgId: String) {
         sentTo.remove(msgId)
+        receivedFrom.remove(msgId)
     }
 
     /**
@@ -314,6 +324,8 @@ class DtnOrchestrator @Inject constructor(
         // Broadcasts: after fanning out to every online peer this cycle, clear from buffer.
         for (msgId in broadcastsToClear) {
             queueManager.markDelivered(msgId)
+            lifecycle.log(LifecycleEvent.BUFFER_CLEARED, msgId,
+                extra = "broadcast fan-out complete (${peers.size} peers)")
             Log.d(TAG, "BROADCAST cleared: $msgId (sent to ${peers.size} peers)")
         }
     }
@@ -360,6 +372,10 @@ class DtnOrchestrator @Inject constructor(
             snapshot.map { it.id }.toSet()
         }
 
+        // Active routing algorithm name — stamped onto each forward for the lifecycle feed and
+        // the message-details view so it's clear which strategy made the decision.
+        val strat = strategySelector.name
+
         var sentCount = 0
         for (msg in snapshot) {
             // If a receipt already confirmed delivery elsewhere, clear locally.
@@ -373,6 +389,14 @@ class DtnOrchestrator @Inject constructor(
 
             val isBroadcast = msg.destinationNodeId == NodeId.BROADCAST
             val isDirectDelivery = msg.destinationNodeId.value == peerId.value
+
+            // Don't echo back to the immediate previous hop either. The wire header only
+            // carries the ORIGIN, so without this an A→B→C→D chain has C bounce the bundle
+            // straight back to B (B isn't the origin A), tying up the half-duplex BLE radio
+            // with a duplicate instead of advancing toward D. Direct delivery and broadcast
+            // are exempt: direct means the previous hop IS the destination, and broadcasts
+            // are meant to fan out to everyone (dedup handles the echo cheaply).
+            if (!isBroadcast && !isDirectDelivery && receivedFrom[msg.id] == peerId.value) continue
 
             // Rate-limit check — but NEVER for direct delivery (dest is RIGHT HERE, send it!)
             if (!isDirectDelivery && !isBroadcast && recentlySentTo(msg.id, peerId.value)) continue
@@ -405,11 +429,16 @@ class DtnOrchestrator @Inject constructor(
                         origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                         hopCount = wireMsg.hopCount, forwardCount = msg.forwardCount + 1,
                         ttlRemainingMs = msg.remainingTtlMs(),
-                        extra = "DIRECT→${peerId.value.takeLast(8)} ✓delivered")
+                        extra = "DIRECT→${peerId.value.takeLast(8)} ✓delivered [$strat]")
+                    // Also emit a buffer-clear so the buffer-history view stops showing this
+                    // message as "still buffered" — direct delivery removes it from our buffer.
+                    lifecycle.log(LifecycleEvent.BUFFER_CLEARED, msg.id,
+                        origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
+                        extra = "delivered directly to ${peerId.value.takeLast(8)}")
                     lifecycle.recordOutgoing(
                         msgId = msg.id, source = msg.originNodeId.value,
                         dest = msg.destinationNodeId.value, me = myId,
-                        nextHop = peerId.value, delivered = true,
+                        nextHop = peerId.value, delivered = true, strategy = strat,
                     )
                     Log.d(TAG, "DELIVERED-DIRECT: ${msg.id.take(8)} → ${peerId.value.takeLast(8)}")
                 }
@@ -418,11 +447,11 @@ class DtnOrchestrator @Inject constructor(
                     lifecycle.log(LifecycleEvent.FORWARDED, msg.id,
                         origin = msg.originNodeId.value, dest = "BROADCAST",
                         hopCount = wireMsg.hopCount, forwardCount = msg.forwardCount + 1,
-                        extra = "BCAST→${peerId.value.takeLast(8)}")
+                        extra = "BCAST→${peerId.value.takeLast(8)} [$strat]")
                     lifecycle.recordOutgoing(
                         msgId = msg.id, source = msg.originNodeId.value,
                         dest = "^all", me = myId,
-                        nextHop = peerId.value, delivered = false,
+                        nextHop = peerId.value, delivered = false, strategy = strat,
                     )
                     Log.d(TAG, "BCAST → ${peerId.value.takeLast(8)}: ${msg.id.take(8)}")
                 }
@@ -430,11 +459,11 @@ class DtnOrchestrator @Inject constructor(
                     lifecycle.log(LifecycleEvent.FORWARDED, msg.id,
                         origin = msg.originNodeId.value, dest = msg.destinationNodeId.value,
                         hopCount = wireMsg.hopCount, forwardCount = msg.forwardCount + 1,
-                        extra = "RELAY→${peerId.value.takeLast(8)}")
+                        extra = "RELAY→${peerId.value.takeLast(8)} [$strat]")
                     lifecycle.recordOutgoing(
                         msgId = msg.id, source = msg.originNodeId.value,
                         dest = msg.destinationNodeId.value, me = myId,
-                        nextHop = peerId.value, delivered = false,
+                        nextHop = peerId.value, delivered = false, strategy = strat,
                     )
                     Log.d(TAG, "RELAYED: ${msg.id.take(8)} → mule ${peerId.value.takeLast(8)}")
                 }
@@ -550,6 +579,10 @@ class DtnOrchestrator @Inject constructor(
         }
 
         if (!msg.messageType.isUserData) return
+
+        // Remember the real previous hop (from the transport, not the wire origin) so the
+        // relay logic never echoes this bundle straight back to whoever just gave it to us.
+        packet.viaPeer?.let { receivedFrom[msg.id] = it.value }
 
         val myId = transport.localNodeId?.value
         val isForMe = myId != null && msg.destinationNodeId.value == myId

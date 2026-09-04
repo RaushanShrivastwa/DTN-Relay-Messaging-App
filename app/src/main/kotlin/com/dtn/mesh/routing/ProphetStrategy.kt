@@ -159,7 +159,8 @@ class ProphetStrategy(
      * Graph construction:
      * - Node "me" has edges to every peer in [onlinePeers] (1-hop neighbors).
      * - For each peer j whose routing summary we've cached, j has edges to every node k
-     *   where `P(j, k) >= 0.5` (meaning j has recently seen k).
+     *   where `P(j, k) >= config.pFloorPath` (meaning j is a plausible carrier toward k,
+     *   including transitive/multi-hop beliefs, not just strong direct links).
      *
      * Returns the **first hop** (the online peer I should forward to), or null if no
      * multi-hop path exists. This keeps the search O(peers²) which is fast for <20 nodes.
@@ -177,7 +178,9 @@ class ProphetStrategy(
             // From the peer's P-vector we know who THEY can likely reach.
             val peerVector = peerPTables[peer] ?: continue
             for ((target, p) in peerVector) {
-                if (p >= 0.5 && target != peer) {
+                // Use the configurable path floor instead of a hard 0.5 so that transitive
+                // predictability (typically ~0.14 for a solid 2-hop link) still forms an edge.
+                if (p >= config.pFloorPath && target != peer) {
                     peerNeighbors.add(target)
                 }
             }
@@ -266,8 +269,21 @@ class ProphetStrategy(
                             // Stage 2: Smart spread (P(j,D) > P(i,D))
                             val peerP = peerPToDest(destKey)
                             val myP = myPToDest(destKey)
-                            if (peerP > myP) ForwardCandidate(msg, priority = peerP * ttlFraction)
-                            else null
+                            when {
+                                // Peer is a strictly better carrier — the normal Stage 2 rule.
+                                peerP > myP -> ForwardCandidate(msg, priority = peerP * ttlFraction)
+                                // Zero-gradient fallback: neither of us has ANY route belief for
+                                // the destination (common in a sparse test net, or before any
+                                // routing summary has propagated). The strict `>` rule would veto
+                                // this outright and strand the bundle forever. Instead allow a
+                                // low-priority exploratory relay so it keeps moving; the
+                                // orchestrator's rate-limit, previous-hop suppression, and hop
+                                // limit bound how far it spreads.
+                                peerP < config.pMinThreshold && myP < config.pMinThreshold ->
+                                    ForwardCandidate(msg, priority = config.relayBaseFloor * ttlFraction)
+                                // Peer is no better and we DO have a belief — hold for a better carrier.
+                                else -> null
+                            }
                         }
                     }
                 }
@@ -370,4 +386,22 @@ data class ProphetConfig(
     val maxForwards: Int = 6,
     /** `H_m` — hard hop limit; a message with `hopCount ≥ maxHops` is never forwarded again. */
     val maxHops: Int = 10,
+    /**
+     * Minimum edge probability for the live-path finder ([findNextHopToward]) to treat a peer
+     * as able to reach a target. The old hard-coded `0.5` cutoff discarded all *transitive*
+     * predictability — e.g. `P(B,D) = P(B,C)·P(C,D)·β ≈ 0.14` for a healthy 2-hop link — so
+     * multi-hop paths were invisible. A lower floor (kept above [pMinThreshold] so pruned noise
+     * doesn't create phantom edges) makes transitive reachability usable while still ignoring
+     * near-zero beliefs.
+     */
+    val pFloorPath: Double = 0.1,
+    /**
+     * Last-resort relay priority used in Stage 2 when NEITHER this node nor the candidate peer
+     * has any route belief for the destination (`P ≈ 0` on both sides). Without it, the strict
+     * `P(peer) > P(me)` gate evaluates `0 > 0 == false` and the message is vetoed outright —
+     * the classic dead-end in a sparse test network. A small positive floor lets the bundle
+     * keep spreading exploratorily; the orchestrator's per-peer rate-limit, previous-hop
+     * suppression, and [maxHops] bound the spread.
+     */
+    val relayBaseFloor: Double = 0.02,
 )
